@@ -1,0 +1,10 @@
+numpy>=1.26
+scipy>=1.12
+
+[all]
+matplotlib>=3.8
+jupyter>=1.0
+
+[test]
+pytest>=8.0
+pytest-timeout>=2.2

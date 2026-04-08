@@ -859,82 +859,707 @@ RaBitQ natively unbiased. TurboQuant needs Prod variant.
 
 ### Phase 7: Performance Optimization
 
+**Goal**: Make VQBench production-viable. Current pure-NumPy implementation is correct but
+leaves 10–100× performance on the table. Phase 7 closes the gap without compiled extensions.
+
 | Task | File | Description | Depends |
 |------|------|-------------|---------|
-| 7.1 | `core/rotation.py` | FWHT replaces dense Π: O(d²)→O(d log d) | 1.1 |
-| 7.2 | All methods | Vectorized batch quantization | All methods |
-| 7.3 | `core/packing.py` | Bit packing: b-bit→uint8, signs→bitfield | All methods |
+| 7.1 | `core/rotation.py` | Structured FWHT rotation: O(d²)→O(d log d) | 1.1 |
+| 7.2 | `core/packing.py` | Bit packing: b-bit indices → uint8/uint64 bitfields | — |
+| 7.3 | All methods | Fully vectorized batch: eliminate per-vector Python loops | All methods |
+| 7.4 | `core/rotation.py` | Precomputed rotation cache: avoid recomputing Π per instance | 1.1 |
+| 7.5 | `tests/test_perf.py` | Performance regression tests | 7.1–7.4 |
 
-### Phase 8: Integration Targets (Future)
+#### 7.1 — Structured FWHT Rotation: O(d²) → O(d log d)
 
-| Task | Description | Depends |
-|------|-------------|---------|
-| 8.1 | PyTorch wrapper (torch.nn.Module) | Phase 1-6 |
-| 8.2 | llama.cpp C port (AVX2/NEON) | Phase 7 |
-| 8.3 | MLX / Metal port | Phase 7 |
+**Current**: `haar_rotation(d, seed)` returns a dense d×d matrix; matmul is O(d²) per vector.
+At d=3072 (Qwen/Gemma head_dim × num_kv_heads), this is 9.4M FLOPs per vector.
+
+**Target**: Replace with structured rotation D₁·H·D₂·H·D₃ (3-layer randomized Hadamard)
+that achieves the same concentration-of-measure guarantee at O(d log d).
+
+```python
+class StructuredRotation:
+    """
+    Pseudo-random rotation via randomized Hadamard: D₁·H·D₂·H·D₃.
+
+    Paper: TurboQuant §4.2; Ailon & Chazelle (2006) "Fast JL Transform"
+
+    Each Dᵢ = diag(sᵢ) where sᵢ ∈ {-1,+1}^d is random sign flip.
+    H = normalized Walsh-Hadamard matrix (applied via butterfly in O(d log d)).
+    Three rounds suffice for near-Haar distribution at d ≥ 128.
+
+    Requires d = power of 2. Pad with zeros if necessary.
+    """
+    def __init__(self, d: int, seed: int):
+        self.d = d
+        self.d_padded = 1 << int(np.ceil(np.log2(d)))  # next power of 2
+        rng = np.random.default_rng(seed)
+        self.signs = [rng.choice([-1, 1], size=self.d_padded).astype(np.float64)
+                      for _ in range(3)]
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        """Apply D₁·H·D₂·H·D₃·x in O(d log d)."""
+        y = np.zeros(self.d_padded)
+        y[:len(x)] = x
+        for s in reversed(self.signs):
+            y *= s
+            y = _fwht_vectorized(y)
+        return y[:self.d]
+
+    def forward_batch(self, X: np.ndarray) -> np.ndarray:
+        """Apply rotation to each row of X ∈ R^{n×d}. Fully vectorized."""
+        ...
+```
+
+**Implementation plan**:
+1. Vectorize the FWHT butterfly with NumPy broadcasting (no Python for-loops)
+2. Implement `_fwht_vectorized(Y)` operating on 2D arrays (n, d) — all n vectors at once
+3. Handle non-power-of-2 d by zero-padding to `d_padded` and truncating output
+4. Add `StructuredRotation` class with `.forward(x)` and `.forward_batch(X)` methods
+5. Maintain backward compat: `haar_rotation()` still available, methods accept either
+6. Add `rotation_mode` parameter to VectorQuantizer: `"dense"` (default) or `"fwht"`
+
+**Vectorized FWHT butterfly** (critical inner kernel):
+
+```python
+def _fwht_vectorized(Y: np.ndarray) -> np.ndarray:
+    """In-place FWHT on rows of Y ∈ R^{n×d}, d must be power of 2."""
+    d = Y.shape[-1]
+    h = 1
+    while h < d:
+        # Y[..., ::2h, :h] and Y[..., ::2h, h:2h] — butterfly pairs
+        # NumPy slice view: reshape to (..., d/2h, 2, h)
+        Y_view = Y.reshape(*Y.shape[:-1], -1, 2, h)
+        a = Y_view[..., 0, :].copy()
+        b = Y_view[..., 1, :]
+        Y_view[..., 0, :] = a + b
+        Y_view[..., 1, :] = a - b
+        h *= 2
+    Y /= np.sqrt(d)
+    return Y
+```
+
+**Speed targets**:
+
+| d | Dense Π (current) | FWHT (target) | Speedup |
+|---|-------------------|---------------|---------|
+| 128 | 0.008 ms | ~0.002 ms | 4× |
+| 512 | 0.04 ms | ~0.004 ms | 10× |
+| 3072 | ~2 ms | ~0.03 ms | 60× |
+
+**Correctness test**: verify that structured rotation preserves:
+- Coordinate std ≈ 1/√d (concentration of measure)
+- MSE distortion within 5% of dense rotation
+- IP bias unchanged
+
+#### 7.2 — Bit Packing: `core/packing.py`
+
+**Current**: Indices stored as int8/int16 arrays (8–16 bits per index).
+At b=2, each index needs 2 bits but occupies 8 → 4× wasted memory.
+
+**File**: `core/packing.py`
+
+```python
+def pack_indices(indices: np.ndarray, num_bits: int) -> np.ndarray:
+    """
+    Pack b-bit indices into uint8 array.
+
+    Args:
+        indices: Integer array with values in [0, 2^b - 1], shape (d,) or (n, d).
+        num_bits: Bits per index (1, 2, 3, or 4).
+
+    Returns:
+        Packed uint8 array. For b=2, d=512: returns 128 bytes instead of 512.
+    """
+
+def unpack_indices(packed: np.ndarray, num_bits: int, d: int) -> np.ndarray:
+    """Unpack uint8 array back to integer indices."""
+
+def pack_signs(signs: np.ndarray) -> np.ndarray:
+    """
+    Pack ±1 sign array into bitfield.
+
+    signs ∈ {-1, +1}^d → uint8 array of ceil(d/8) bytes.
+    Convention: +1 → bit=1, -1 → bit=0.
+    """
+
+def unpack_signs(packed: np.ndarray, d: int) -> np.ndarray:
+    """Unpack bitfield back to ±1 array."""
+```
+
+**Packing strategy by bit-width**:
+
+| b | Values | Pack ratio | Method |
+|---|--------|-----------|--------|
+| 1 | {0, 1} | 8 per byte | bit shifts |
+| 2 | {0..3} | 4 per byte | 2-bit fields |
+| 3 | {0..7} | 2 per byte + waste | 4-bit nibbles (pad to 4) |
+| 4 | {0..15} | 2 per byte | 4-bit nibbles |
+
+**Memory reduction at d=512**:
+
+| b | Current (int8) | Packed | Reduction |
+|---|---------------|--------|-----------|
+| 1 | 512 B | 64 B | 8× |
+| 2 | 512 B | 128 B | 4× |
+| 4 | 512 B | 256 B | 2× |
+
+**Integration**: Add `PackedQuantizedVector` dataclass that wraps packed arrays.
+Methods gain `quantize_packed()` / `dequantize_packed()` that pack on the fly.
+The unpacked path remains the default; packed path is opt-in for memory-critical use.
+
+#### 7.3 — Fully Vectorized Batch Operations
+
+**Current state**: TurboQuantMSE, RaBitQ1Bit, ExtRaBitQ, PQ all have vectorized `quantize_batch`.
+Missing vectorized batch: `QJLQuantizer`, `TurboQuantProd`, `OPQ` (delegates to PQ).
+
+**TurboQuantProd batch** (highest priority — most complex method):
+
+```python
+def quantize_batch(self, X: np.ndarray) -> list[QuantizedVector]:
+    n = len(X)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)      # (n, 1)
+    safe_norms = np.maximum(norms, 1e-30)
+
+    if self._mse_bits > 0:
+        X_hat = X / safe_norms
+        Y = X_hat @ self._rotation.T                       # (n, d)
+        all_indices = np.searchsorted(self._boundaries, Y).astype(np.int8)
+        Y_hat = self._centroids[all_indices]                # (n, d) — MSE reconstruction
+        X_mse = (norms * (Y_hat @ self._rotation))          # (n, d)
+    else:
+        all_indices = np.zeros((n, self.d), dtype=np.int8)
+        X_mse = np.zeros_like(X)
+
+    residuals = X - X_mse                                   # (n, d)
+    gammas = np.linalg.norm(residuals, axis=1)              # (n,)
+
+    # Batch QJL: sign(S @ residual.T).T
+    projections = residuals @ self._S.T                     # (n, d)
+    all_signs = np.sign(projections).astype(np.int8)
+    all_signs[all_signs == 0] = 1
+    ...
+```
+
+**QJL batch** (simpler):
+```python
+def quantize_batch(self, X: np.ndarray) -> list[QuantizedVector]:
+    gammas = np.linalg.norm(X, axis=1)                     # (n,)
+    projections = X @ self._S.T                             # (n, d)
+    all_signs = np.sign(projections).astype(np.int8)
+    all_signs[all_signs == 0] = 1
+    ...
+```
+
+**Dequantize batch** — similar vectorization for all methods, operating on stacked arrays.
+
+**Perf targets (post-optimization)**:
+
+| Operation | d=128, n=1000 | d=512, n=1000 | Requirement |
+|-----------|--------------|--------------|-------------|
+| TQ_mse batch | < 10 ms | < 30 ms | N3: < 50 ms |
+| TQ_prod batch | < 20 ms | < 50 ms | — |
+| RaBitQ batch | < 10 ms | < 30 ms | — |
+| PQ batch | < 30 ms | < 60 ms | (k-means-based) |
+
+#### 7.4 — Rotation Cache
+
+**Problem**: Each VectorQuantizer instance generates its own rotation matrix on `__init__`.
+At d=512, that's a 512×512×8 = 2MB allocation per instance. When benchmarking 7 methods
+with shared `(d, seed)`, we allocate 14 MB of identical matrices.
+
+**Solution**: Module-level LRU cache keyed on `(d, seed)`.
+
+```python
+_rotation_cache: dict[tuple[int, int], np.ndarray] = {}
+
+def haar_rotation(d: int, seed: int) -> np.ndarray:
+    key = (d, seed)
+    if key not in _rotation_cache:
+        _rotation_cache[key] = _haar_rotation_impl(d, seed)
+    return _rotation_cache[key]
+```
+
+Same for `StructuredRotation` instances. Read-only — callers must never mutate the returned matrix.
+
+#### 7.5 — Performance Regression Tests
+
+```python
+# tests/test_perf.py
+
+def test_single_vector_under_1ms():
+    """Req N2: single vector d=512 < 1ms."""
+    q = TurboQuantMSE(d=512, num_bits=2, seed=42)
+    x = random_unit_vectors(1, 512, seed=0)[0]
+    t0 = time.perf_counter()
+    for _ in range(100):
+        q.quantize(x)
+    elapsed_ms = (time.perf_counter() - t0) / 100 * 1000
+    assert elapsed_ms < 1.0
+
+def test_batch_1000_under_50ms():
+    """Req N3: batch 1000 at d=128 < 50ms."""
+    q = TurboQuantMSE(d=128, num_bits=2, seed=42)
+    X = random_unit_vectors(1000, 128, seed=0)
+    t0 = time.perf_counter()
+    q.quantize_batch(X)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    assert elapsed_ms < 50.0
+
+def test_fwht_faster_than_dense():
+    """FWHT rotation should be ≥3× faster than dense at d=512."""
+    ...
+```
+
+---
+
+### Phase 8: Integration — PyTorch Wrapper & Native Ports
+
+**Goal**: Bridge VQBench from NumPy benchmark to production-usable KV-cache compression.
+Three integration paths, in order of priority.
+
+| Task | File | Description | Depends |
+|------|------|-------------|---------|
+| 8.1 | `torch_wrapper/module.py` | `QuantizedKVCache` — torch.nn.Module | Phase 6 |
+| 8.2 | `torch_wrapper/hook.py` | HuggingFace `transformers` integration hook | 8.1 |
+| 8.3 | `torch_wrapper/kernels.py` | Custom CUDA/Triton kernels (optional) | 8.1 |
+| 8.4 | `native/mlx_port.py` | Apple MLX port for M-series inference | Phase 7 |
+| 8.5 | `benchmarks/torch_bench.py` | PyTorch speed benchmarks vs NumPy | 8.1 |
+
+#### 8.1 — PyTorch Module: `QuantizedKVCache`
+
+```
+vqbench/
+└── torch_wrapper/
+    ├── __init__.py
+    ├── module.py          # QuantizedKVCache nn.Module
+    ├── hook.py            # HuggingFace model_hook integration
+    ├── kernels.py         # Optional Triton/CUDA fused kernels
+    └── functional.py      # Functional API: quantize_kv, dequantize_kv
+```
+
+**Core class**:
+
+```python
+class QuantizedKVCache(torch.nn.Module):
+    """
+    Drop-in replacement for transformers KV cache with VQ compression.
+
+    Usage:
+        cache = QuantizedKVCache(
+            head_dim=128,
+            num_kv_heads=8,
+            method_key="TurboQuantProd",   # unbiased IP for attention
+            method_value="TurboQuantMSE",  # low MSE for output
+            num_bits_key=3,
+            num_bits_value=3,
+        )
+
+        # In attention forward:
+        compressed_k, compressed_v = cache.update(new_keys, new_values)
+        keys, values = cache.get()    # decompressed for attention
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        num_kv_heads: int,
+        method_key: str = "TurboQuantProd",
+        method_value: str = "TurboQuantMSE",
+        num_bits_key: int = 3,
+        num_bits_value: int = 3,
+        seed: int = 42,
+    ): ...
+
+    def update(self, keys: torch.Tensor, values: torch.Tensor) -> None:
+        """Compress and append new KV pairs. keys/values: (batch, heads, seq, d)."""
+
+    def get(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decompress all cached KV. Returns (keys, values)."""
+
+    @property
+    def seq_len(self) -> int: ...
+
+    @property
+    def memory_bytes(self) -> int:
+        """Current compressed cache size in bytes."""
+```
+
+**Implementation strategy**:
+1. Internal storage: keep compressed representations as Python lists of QuantizedVector
+   (NumPy backend). Convert torch→numpy on `update()`, numpy→torch on `get()`.
+2. This is simple but has CPU↔GPU transfer overhead — acceptable for Phase 8.1.
+3. Phase 8.3 adds fused Triton kernels to avoid the transfer.
+
+**Tensor layout**: Per-head compression. Each KV head's cache is an independent
+`KVCacheCompressor` instance. GQA naturally supported: fewer KV heads = fewer compressors.
+
+```python
+# Internal layout:
+self._compressors: list[KVCacheCompressor]  # one per KV head
+# _compressors[h] holds all tokens for head h
+```
+
+#### 8.2 — HuggingFace Transformers Hook
+
+Integration with `transformers` model inference via cache replacement:
+
+```python
+def apply_quantized_cache(
+    model: PreTrainedModel,
+    method_key: str = "TurboQuantProd",
+    method_value: str = "TurboQuantMSE",
+    num_bits: int = 3,
+) -> PreTrainedModel:
+    """
+    Monkey-patch model to use quantized KV cache during generation.
+
+    Replaces the DynamicCache with QuantizedKVCache in the model's
+    generate() call. Works with Qwen2, Gemma2, LLaMA, Mistral.
+
+    Usage:
+        model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-27B")
+        apply_quantized_cache(model, num_bits=3)
+        output = model.generate(input_ids, max_new_tokens=1000)
+    """
+```
+
+**Hook mechanism**: `transformers` ≥4.38 uses `Cache` objects (DynamicCache, StaticCache).
+We subclass `Cache` and override `update()` / `__getitem__()`:
+
+```python
+class VQBenchCache(Cache):
+    """transformers-compatible Cache backed by VQ compression."""
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        # Compress incoming KV
+        self._layers[layer_idx].compress(
+            key_states.cpu().numpy(),    # (batch, heads, seq, d)
+            value_states.cpu().numpy(),
+        )
+        # Return decompressed for current attention step
+        return self._get_decompressed(layer_idx)
+```
+
+**Supported model families** (all use `Cache` protocol):
+
+| Family | head_dim | GQA ratio | Notes |
+|--------|----------|-----------|-------|
+| Qwen2/Qwen3 | 128 | 4:1–8:1 | Primary target |
+| Gemma2/Gemma4 | 256 | 4:1 | Larger head_dim |
+| LLaMA 3.x | 128 | 8:1 | Most common |
+| Mistral/Mixtral | 128 | 8:1 | Sliding window variant |
+
+#### 8.3 — Custom Kernels (Optional, Stretch)
+
+For GPU-resident compression (avoid CPU↔GPU transfers):
+
+```python
+# Triton kernel for batch TurboQuant quantization on GPU
+@triton.jit
+def turbo_quant_mse_kernel(
+    X_ptr, indices_ptr, norms_ptr,
+    rotation_ptr, centroids_ptr, boundaries_ptr,
+    d: tl.constexpr, num_bits: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused rotate + searchsorted + store on GPU."""
+    ...
+```
+
+**Priority**: Low. The CPU NumPy path + torch.cuda.synchronize is sufficient
+for Phase 9 evaluation. Only build if GPU transfer is the bottleneck.
+
+#### 8.4 — Apple MLX Port
+
+For native M-series inference (M1–M5 Pro):
+
+```python
+# native/mlx_port.py
+import mlx.core as mx
+
+class MLXTurboQuantMSE:
+    """TurboQuantMSE using MLX operations for unified memory."""
+
+    def __init__(self, d, num_bits, seed=42):
+        self._rotation = mx.array(haar_rotation(d, seed))
+        centroids, boundaries = lloyd_max_codebook(num_bits, d)
+        self._centroids = mx.array(centroids)
+        self._boundaries = mx.array(boundaries)
+
+    def quantize_batch(self, X: mx.array) -> ...:
+        norms = mx.linalg.norm(X, axis=1, keepdims=True)
+        X_hat = X / mx.maximum(norms, 1e-30)
+        Y = X_hat @ self._rotation.T
+        indices = mx.searchsorted(self._boundaries, Y)
+        ...
+```
+
+**Advantage on M5 Pro**: MLX uses unified memory — no CPU↔GPU transfer.
+The rotation matmul and searchsorted run on the Neural Engine / GPU
+without data movement, which is the main bottleneck in the NumPy path.
+
+**Test**: Verify MLX output matches NumPy to fp32 tolerance.
+
+#### 8.5 — Integration Benchmarks
+
+```python
+# benchmarks/torch_bench.py
+
+def bench_kv_cache_throughput():
+    """Measure tokens/s for quantized KV cache at different seq_lens."""
+    for seq_len in [1024, 4096, 16384, 65536, 131072]:
+        for method in ["TurboQuantMSE", "TurboQuantProd", "RaBitQ1Bit"]:
+            for bits in [2, 3, 4]:
+                cache = QuantizedKVCache(...)
+                # Simulate autoregressive generation
+                for t in range(seq_len):
+                    cache.update(new_k, new_v)   # compress 1 token
+                    k, v = cache.get()            # decompress all
+                # Report: tokens/s, peak memory, latency breakdown
+
+def bench_memory_vs_baseline():
+    """Compare memory footprint: fp16 cache vs quantized at 128K tokens."""
+    # fp16 baseline: 2 * num_layers * num_kv_heads * seq_len * head_dim * 2 bytes
+    # Qwen3.5-27B: 2 * 64 * 4 * 131072 * 128 * 2 = ~8.6 GB
+    # At 3-bit:    2 * 64 * 4 * 131072 * 128 * 3/8 + metadata ≈ ~1.6 GB
+    # Compression ratio: ~5.3×
+```
+
+---
 
 ### Phase 9: Real Model Validation
 
 End-to-end KV-cache compression on production LLMs — the ultimate acceptance test.
+This phase proves that VQBench methods work on real attention patterns, not just
+synthetic unit vectors.
 
-| Task | Description | Depends |
-|------|-------------|---------|
-| 9.1 | **Qwen3.5-27B** KV-cache compression | 8.1 (PyTorch wrapper) |
-| 9.2 | **Gemma-4** KV-cache compression | 8.1 (PyTorch wrapper) |
-| 9.3 | Cross-model comparison report | 9.1, 9.2 |
+| Task | File | Description | Depends |
+|------|------|-------------|---------|
+| 9.1 | `validation/qwen.py` | Qwen3.5-27B KV-cache compression eval | 8.1, 8.2 |
+| 9.2 | `validation/gemma.py` | Gemma-4 KV-cache compression eval | 8.1, 8.2 |
+| 9.3 | `validation/report.py` | Cross-model comparison & analysis | 9.1, 9.2 |
+| 9.4 | `validation/run_eval.py` | Unified evaluation driver script | 9.1, 9.2 |
 
-#### 9.1 / 9.2 — Per-Model Evaluation
+#### 9.1 / 9.2 — Per-Model Evaluation Protocol
 
-For each model (Qwen3.5-27B, Gemma-4):
+**Step 1: Setup & Model Loading**
 
-1. **Extract KV cache** from a representative prompt set (long-context tasks)
-2. **Compress** with each method at b ∈ {2, 3, 4} using the pluggable KVCacheCompressor
-3. **Measure compression metrics**:
-   - KV-cache memory reduction (GB)
-   - Quantize/dequantize throughput (tokens/s)
-4. **Measure quality metrics**:
-   - Attention output MSE vs full precision
-   - Perplexity on eval set (WikiText-2, C4)
-   - Downstream task accuracy (MMLU, HumanEval, or model-appropriate benchmarks)
-5. **Recommended config** per model: which method × bit-width gives the best quality/compression tradeoff
+```python
+# validation/qwen.py (Gemma equivalent is parallel)
+
+MODEL_ID = "Qwen/Qwen3.5-27B"     # or "google/gemma-4-27b"
+DEVICE = "mps"                      # M5 Pro — use MPS backend
+DTYPE = torch.bfloat16              # Qwen3.5 native dtype
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID, torch_dtype=DTYPE, device_map="auto",
+)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+```
+
+**Step 2: Evaluation Datasets**
+
+| Dataset | Purpose | Metric | Tokens |
+|---------|---------|--------|--------|
+| WikiText-2 | Language modeling | Perplexity | ~250K |
+| C4 (validation, 1K samples) | General LM | Perplexity | ~500K |
+| RULER (4K, 8K, 16K, 32K) | Long-context retrieval | Accuracy | Variable |
+| MMLU (5-shot) | Knowledge reasoning | Accuracy | ~150K |
+
+Rationale: Perplexity catches subtle quality loss. RULER tests whether
+attention still reaches distant tokens after KV compression.
+MMLU tests downstream task impact.
+
+**Step 3: Compression Configurations**
+
+Test matrix — exhaustive grid over methods × bit-widths:
+
+| Config | Key Method | Value Method | Key bits | Value bits | Notes |
+|--------|-----------|-------------|----------|------------|-------|
+| Baseline | fp16 | fp16 | 16 | 16 | No compression |
+| TQ-MSE-2 | TurboQuantMSE | TurboQuantMSE | 2 | 2 | Biased keys |
+| TQ-MSE-3 | TurboQuantMSE | TurboQuantMSE | 3 | 3 | |
+| TQ-MSE-4 | TurboQuantMSE | TurboQuantMSE | 4 | 4 | |
+| TQ-Prod-2 | TurboQuantProd | TurboQuantMSE | 2 | 2 | Unbiased keys |
+| TQ-Prod-3 | TurboQuantProd | TurboQuantMSE | 3 | 3 | **Expected sweet spot** |
+| TQ-Prod-4 | TurboQuantProd | TurboQuantMSE | 4 | 4 | |
+| RaBitQ-2 | ExtRaBitQ | ExtRaBitQ | 2 | 2 | Unbiased keys |
+| RaBitQ-3 | ExtRaBitQ | ExtRaBitQ | 3 | 3 | |
+| RaBitQ-4 | ExtRaBitQ | ExtRaBitQ | 4 | 4 | |
+| Mixed-3 | TurboQuantProd | TurboQuantMSE | 3 | 2 | Asym: more bits for keys |
+
+**Key design decision**: Use TurboQuantProd (unbiased) for keys and TurboQuantMSE (low MSE) for values.
+Keys participate in softmax(QK^T) — IP bias directly distorts attention weights.
+Values are just linearly combined — MSE is what matters.
+
+**Step 4: Measurement Protocol**
+
+```python
+def evaluate_config(model, tokenizer, config, datasets):
+    """Run full evaluation for one compression config."""
+    apply_quantized_cache(model, **config)
+
+    results = {}
+
+    # (a) Perplexity — sliding window, stride = max_length // 2
+    for name, dataset in [("wikitext2", wt2), ("c4", c4_val)]:
+        ppl = evaluate_perplexity(model, tokenizer, dataset, max_length=2048)
+        results[f"ppl_{name}"] = ppl
+
+    # (b) Long-context — RULER benchmark at multiple lengths
+    for ctx_len in [4096, 8192, 16384, 32768]:
+        acc = evaluate_ruler(model, tokenizer, ctx_len=ctx_len)
+        results[f"ruler_{ctx_len}"] = acc
+
+    # (c) MMLU — 5-shot
+    results["mmlu"] = evaluate_mmlu(model, tokenizer, n_shot=5)
+
+    # (d) Memory & Speed
+    results["peak_memory_gb"] = torch.mps.current_allocated_memory() / 1e9
+    results["tokens_per_sec"] = measure_generation_speed(model, tokenizer)
+
+    return results
+```
+
+**Step 5: Statistical Rigor**
+
+- Run each perplexity eval 3× with different random seeds for few-shot prompts
+- Report mean ± std
+- Use paired comparisons: Δperplexity = ppl_compressed − ppl_baseline
+- Significance: require |Δppl| confidence interval excludes 0
 
 #### Model-Specific Considerations
 
-| Model | head_dim | num_kv_heads | Context | Notes |
-|-------|----------|-------------|---------|-------|
-| Qwen3.5-27B | 128 | GQA | 128K | Large KV cache, high compression value |
-| Gemma-4 | 256 | GQA | 128K+ | Larger head_dim, may favor different bit-width |
+| Aspect | Qwen3.5-27B | Gemma-4 |
+|--------|------------|---------|
+| Architecture | Qwen2-based decoder | Gemma2-based decoder |
+| head_dim | 128 | 256 |
+| num_kv_heads | 4 (GQA 7:1) | 8 (GQA 4:1) |
+| num_layers | 64 | 46 |
+| Context window | 128K (YaRN) | 128K+ |
+| KV cache size (fp16, 128K) | ~8.6 GB | ~19.2 GB |
+| KV cache at 3-bit | ~1.6 GB | ~3.6 GB |
+| dtype | bfloat16 | bfloat16 |
+| M5 Pro fit? | Yes (36GB unified) | Tight — may need 4-bit or offload |
+| Tokenizer | Qwen2Tokenizer | GemmaTokenizer |
+| HF model class | Qwen2ForCausalLM | Gemma2ForCausalLM |
+
+**Gemma-4 head_dim=256 hypothesis**: Larger head_dim means each coordinate
+has smaller variance (1/256 vs 1/128). Lloyd-Max is more accurate at lower
+variance → TurboQuant's advantage over RaBitQ may be larger at head_dim=256.
+
+**GQA interaction**: GQA means fewer KV heads (each shared across multiple Q heads).
+Compression applies per KV head, so GQA + VQ is multiplicative compression.
+Qwen3.5 GQA 7:1 + 3-bit VQ ≈ 37× compression vs naive fp16.
 
 #### 9.3 — Cross-Model Report
 
-Deliverable: a comparison showing whether the winning method/bit-width is **model-dependent** or **universal**.
-Key question: does TurboQuant's Lloyd-Max advantage hold across different architectures and head dimensions?
+**Deliverable**: A structured comparison answering three questions:
+
+**Q1: Is the winning method model-dependent or universal?**
+
+Expected: TurboQuantProd for keys + TurboQuantMSE for values wins universally,
+but the optimal bit-width may differ:
+- Qwen3.5 (head_dim=128): 3-bit likely sufficient
+- Gemma-4 (head_dim=256): may tolerate 2-bit for values
+
+**Q2: Does TurboQuant's Lloyd-Max advantage hold across architectures?**
+
+Compare TQ-Prod-3 vs RaBitQ-3 on both models:
+- If TQ wins on both → Lloyd-Max is universally better
+- If RaBitQ wins on Gemma-4 → the advantage is head_dim-dependent
+
+**Q3: What's the Pareto frontier (quality vs compression)?**
+
+```
+Perplexity                            Pareto
+Degradation  ┤                          Front
+             │  ×RaBitQ-2                 │
+   1.0 ──────│──×TQ-MSE-2───────────────│──
+             │     ×TQ-Prod-2            │
+   0.5 ──────│────────×RaBitQ-3──────── │──   ← S11/S12 threshold
+             │         ×TQ-Prod-3        │
+   0.1 ──────│───────────×TQ-Prod-4─────│──
+             │                  ×fp16    │
+   0.0 ──────┼───────────────────────────┤──
+             2×     5×     10×    15×
+                  Compression Ratio
+```
+
+**Report format**: Markdown tables + matplotlib plots, generated by `validation/report.py`.
+
+#### 9.4 — Evaluation Driver
+
+```python
+# validation/run_eval.py — single command to run everything
+
+"""
+Usage:
+    python -m vqbench.validation.run_eval --model qwen --bits 2,3,4
+    python -m vqbench.validation.run_eval --model gemma --bits 3
+    python -m vqbench.validation.run_eval --model all --full   # complete grid
+"""
+
+def main():
+    args = parse_args()
+    configs = build_config_grid(args.model, args.bits)
+    results = []
+    for config in configs:
+        print(f"Evaluating {config['name']}...")
+        r = evaluate_config(model, tokenizer, config, datasets)
+        results.append(r)
+        save_checkpoint(results)   # incremental save
+    generate_report(results, output_dir=args.output)
+```
+
+**Estimated runtime on M5 Pro (36GB)**:
+
+| Model | Configs | Est. per config | Total |
+|-------|---------|----------------|-------|
+| Qwen3.5-27B | 11 | ~30 min | ~5.5 hours |
+| Gemma-4 | 11 | ~45 min | ~8 hours |
+| **Full grid** | **22** | — | **~14 hours** |
+
+Checkpoint after each config so runs can be resumed.
 
 ### Dependency Graph
 
 ```
-Phase 1 (Core)
+Phase 1 (Core)         ✅ DONE
   │
-  ├──→ Phase 2 (TurboQuant) ──┐
-  ├──→ Phase 3 (RaBitQ)    ───┤
-  ├──→ Phase 4 (PQ)        ───┤
+  ├──→ Phase 2 (TurboQuant) ──┐  ✅ DONE
+  ├──→ Phase 3 (RaBitQ)    ───┤  ✅ DONE
+  ├──→ Phase 4 (PQ)        ───┤  ✅ DONE
   │                            │
   │                            ▼
-  │                      Phase 5 (Evaluation)
+  │                      Phase 5 (Evaluation)  ✅ DONE
   │                            │
   │                            ▼
-  │                      Phase 6 (KV Cache)
+  │                      Phase 6 (KV Cache)    ✅ DONE
   │                            │
-  │                            ▼
-  └──────────────────→   Phase 7 (Optimization)
-                               │
-                               ▼
-                         Phase 8 (Integration)
-                               │
-                               ▼
-                         Phase 9 (Real Model Validation)
-                           Qwen3.5-27B + Gemma-4
+  │              ┌─────────────┤
+  │              ▼             ▼
+  │        Phase 7         Phase 8.1
+  │     (Optimization)   (PyTorch Wrapper)
+  │         │    │             │
+  │         │    │             ▼
+  │         │    │       Phase 8.2
+  │         │    │    (HF Transformers Hook)
+  │         │    │             │
+  │         ▼    │             ▼
+  │      Phase 8.4        Phase 9.1 ──→ Phase 9.3
+  │    (MLX Port)         (Qwen3.5)    (Report)
+  │                       Phase 9.2 ──↗
+  │                       (Gemma-4)
+  │
+  └──→ Phase 8.3 (Triton Kernels — optional, stretch)
 ```
+
+**Critical path to Phase 9**: Phase 8.1 → 8.2 → 9.1/9.2 → 9.3
+Phase 7 is **not blocking** — NumPy is fast enough for evaluation.
+Phase 7 and 8.4 (MLX) can proceed in parallel with Phase 9.
 
 Phases 2, 3, 4 can proceed **in parallel** after Phase 1.
 
@@ -957,27 +1582,39 @@ These invariants ensure no method gets an unfair advantage:
 
 ## 11. Success Criteria
 
-| # | Criterion | Metric |
-|---|-----------|--------|
-| S1 | All 7 quantizers pass interface test | `test_interface.py` green |
-| S2 | TQ_mse MSE within 10% of paper | Table in §5.3 |
-| S3 | TQ_prod unbiased, variance×d within 15% | Table in §5.5 |
-| S4 | TQ_mse b=1 bias α ∈ [0.62, 0.66] | §5.3 |
-| S5 | RaBitQ estimator \|bias\| < 0.01 | §5.6 |
-| S6 | ExtRaBitQ B=1 = RaBitQ 1-bit | §5.7 |
-| S7 | Fixed seed → reproducible results | `test_fairness.py` green |
-| S8 | d=512 single-vector quantize < 1ms | `eval/speed.py` |
-| S9 | Metadata overhead < 5% for n ≥ 1000 | `eval/compression.py` |
-| S10 | Complete distortion-rate plot for all methods | `notebooks/01_distortion_comparison.ipynb` |
-| S11 | Qwen3.5-27B: perplexity degradation < 0.5 at 3-bit | Phase 9 eval |
-| S12 | Gemma-4: perplexity degradation < 0.5 at 3-bit | Phase 9 eval |
-| S13 | Cross-model report identifying best method per scenario | Phase 9 deliverable |
+| # | Criterion | Metric | Phase | Status |
+|---|-----------|--------|-------|--------|
+| S1 | All 7 quantizers pass interface test | `test_interface.py` green | 5 | ✅ Done |
+| S2 | TQ_mse MSE within 10% of Lloyd-Max | Table in §5.3 | 2 | ✅ Done |
+| S3 | TQ_prod unbiased, variance×d within 15% | Table in §5.5 | 2 | ✅ Done |
+| S4 | TQ_mse b=1 bias α ∈ [0.62, 0.66] | §5.3 | 2 | ✅ Done |
+| S5 | RaBitQ estimator \|bias\| < 0.01 | §5.6 | 3 | ✅ Done |
+| S6 | ExtRaBitQ B=1 = RaBitQ 1-bit | §5.7 | 3 | ✅ Done |
+| S7 | Fixed seed → reproducible results | `test_fairness.py` green | 5 | ✅ Done |
+| S8 | d=512 single-vector quantize < 1ms | `eval/speed.py` | 5 | ✅ 0.008ms |
+| S9 | Metadata overhead < 5% for n ≥ 1000 | `eval/compression.py` | 5 | ✅ 1-6% |
+| S10 | Complete distortion-rate plot for all methods | `notebooks/01_distortion_comparison.ipynb` | 5 | Pending |
+| S11 | FWHT ≥ 3× faster than dense at d ≥ 512 | `test_perf.py` | 7 | Pending |
+| S12 | Bit-packed storage ≥ 2× smaller than int8 | `test_perf.py` | 7 | Pending |
+| S13 | PyTorch wrapper passes integration test | `test_torch_wrapper.py` | 8 | Pending |
+| S14 | Qwen3.5-27B: perplexity degradation < 0.5 at 3-bit | Phase 9 eval | 9 | Pending |
+| S15 | Gemma-4: perplexity degradation < 0.5 at 3-bit | Phase 9 eval | 9 | Pending |
+| S16 | Cross-model report identifying best method per scenario | Phase 9 deliverable | 9 | Pending |
 
 ---
 
 ## 12. Changelog
 
-### v4 (current) — Add Real Model Validation
+### v5 (current) — Detailed Phase 7/8/9 Execution Plans
+
+- **Phase 7 expanded**: Vectorized FWHT butterfly (O(d²)→O(d log d)), bit packing (2-8× memory savings), rotation cache, perf regression tests
+- **Phase 8 expanded**: `QuantizedKVCache` torch.nn.Module, HuggingFace `Cache` subclass integration, MLX port for Apple Silicon, optional Triton kernels
+- **Phase 9 expanded**: Full evaluation protocol with 4 datasets (WikiText-2, C4, RULER, MMLU), 11 configs per model, mixed key/value methods, statistical rigor
+- Updated dependency graph: Phase 7 no longer blocks Phase 9 (NumPy fast enough); critical path is 8.1→8.2→9.1/9.2→9.3
+- Added success criteria S11-S16 with Phase/Status tracking
+- Marked Phases 1-6 as ✅ DONE (121 tests passing)
+
+### v4 — Add Real Model Validation
 
 - Added Phase 9: end-to-end KV-cache compression on Qwen3.5-27B and Gemma-4
 - Added success criteria S11-S13 for perplexity and cross-model comparison

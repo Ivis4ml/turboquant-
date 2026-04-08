@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vqbench"
+version = "0.1.0"
+description = "Unified Vector Quantization Benchmark: TurboQuant, RaBitQ, PQ under one API"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-timeout>=2.2"]
+all = ["matplotlib>=3.8", "jupyter>=1.0"]
+
+[tool.setuptools.packages.find]
+include = ["vqbench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["vqbench/tests"]
+addopts = "-v --tb=short"
