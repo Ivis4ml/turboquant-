@@ -82,3 +82,28 @@ class QJLQuantizer(VectorQuantizer):
     def storage_bits(self, qv: QuantizedVector) -> int:
         """d bits (signs) + 16 bits (gamma fp16)."""
         return self.d + 16
+
+    def quantize_batch(self, X: np.ndarray) -> list[QuantizedVector]:
+        """Vectorized batch QJL quantization."""
+        gammas = np.linalg.norm(X, axis=1)           # (n,)
+        projections = X @ self._S.T                   # (n, d) — batch S·x
+        all_signs = np.sign(projections).astype(np.int8)
+        all_signs[all_signs == 0] = 1
+        results = []
+        for i in range(len(X)):
+            results.append(QuantizedVector(
+                indices=np.zeros(self.d, dtype=np.int8),
+                norms=np.array([gammas[i]], dtype=np.float32),
+                signs=all_signs[i],
+            ))
+        return results
+
+    def dequantize_batch(self, qvs: list[QuantizedVector]) -> np.ndarray:
+        """Vectorized batch QJL dequantization."""
+        n = len(qvs)
+        gammas = np.array([float(qv.norms[0]) for qv in qvs])     # (n,)
+        signs = np.array([qv.signs for qv in qvs], dtype=np.float64)  # (n, d)
+        # x̃_i = √(π/2)/d · γ_i · Sᵀ · signs_i
+        # batch: X̃ = (√(π/2)/d) · diag(γ) · (signs @ S)
+        out = (QJL_CONST / self.d) * (signs @ self._S) * gammas[:, np.newaxis]
+        return out

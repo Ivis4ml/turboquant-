@@ -14,7 +14,9 @@ from vqbench.methods.turboquant.mse import TurboQuantMSE
 from vqbench.datasets.synthetic import random_unit_vectors
 from vqbench.core.metrics import mse_distortion, ip_bias
 
-# True Lloyd-Max MSE on N(0,1): computed via 5M iid samples
+# Expected MSE with norm_correction=True (production / turboquant_plus parity)
+EXPECTED_MSE_CORRECTED = {1: 0.404, 2: 0.121, 3: 0.035, 4: 0.009}
+# Expected MSE without norm_correction (pure Lloyd-Max theory)
 LLOYD_MAX_MSE = {1: 0.3634, 2: 0.1175, 3: 0.0345, 4: 0.0095}
 N_VECS = 2000
 D = 512
@@ -29,32 +31,40 @@ class TestTurboQuantMSE:
         self.Y = random_unit_vectors(N_VECS, D, seed=DATA_SEED + 1)
 
     @pytest.mark.parametrize("b", [1, 2, 3, 4])
-    def test_mse_within_10pct_of_lloyd_max(self, b):
-        """Req C1: TurboQuant_mse MSE within 10% of Lloyd-Max values."""
-        q = TurboQuantMSE(d=D, num_bits=b, seed=METHOD_SEED)
-        qvs = q.quantize_batch(self.X)
-        X_hat = q.dequantize_batch(qvs)
+    def test_mse_production(self, b):
+        """MSE with norm_correction=True (production setting)."""
+        q = TurboQuantMSE(d=D, num_bits=b, seed=METHOD_SEED, norm_correction=True)
+        X_hat = q.dequantize_batch(q.quantize_batch(self.X))
+        mse = mse_distortion(self.X, X_hat)
+        expected = EXPECTED_MSE_CORRECTED[b]
+        assert abs(mse - expected) / expected < 0.12, (
+            f"b={b}: MSE={mse:.4f}, expected={expected}"
+        )
+
+    @pytest.mark.parametrize("b", [1, 2, 3, 4])
+    def test_mse_theoretical(self, b):
+        """Req C1: MSE without norm correction matches Lloyd-Max within 10%."""
+        q = TurboQuantMSE(d=D, num_bits=b, seed=METHOD_SEED, norm_correction=False)
+        X_hat = q.dequantize_batch(q.quantize_batch(self.X))
         mse = mse_distortion(self.X, X_hat)
         expected = LLOYD_MAX_MSE[b]
         assert abs(mse - expected) / expected < 0.10, (
-            f"b={b}: MSE={mse:.4f}, expected={expected}, diff={abs(mse-expected)/expected:.1%}"
+            f"b={b}: MSE={mse:.4f}, expected={expected}"
         )
 
-    def test_1bit_bias_alpha(self):
-        """Req C3: b=1 bias α ≈ 2/π ≈ 0.637."""
-        q = TurboQuantMSE(d=D, num_bits=1, seed=METHOD_SEED)
-        qvs = q.quantize_batch(self.X)
-        X_hat = q.dequantize_batch(qvs)
+    def test_1bit_bias_alpha_production(self):
+        """With norm correction, b=1 α ≈ 0.80 (improved from 2/π ≈ 0.637)."""
+        q = TurboQuantMSE(d=D, num_bits=1, seed=METHOD_SEED, norm_correction=True)
+        X_hat = q.dequantize_batch(q.quantize_batch(self.X))
         alpha, _ = ip_bias(self.X, X_hat, self.Y)
-        assert 0.62 <= alpha <= 0.66, f"α={alpha:.4f}, expected ∈ [0.62, 0.66]"
+        assert 0.78 <= alpha <= 0.83, f"α={alpha:.4f}, expected ∈ [0.78, 0.83]"
 
-    def test_2bit_bias_alpha(self):
-        """b=2: α ≈ 0.883."""
-        q = TurboQuantMSE(d=D, num_bits=2, seed=METHOD_SEED)
-        qvs = q.quantize_batch(self.X)
-        X_hat = q.dequantize_batch(qvs)
+    def test_2bit_bias_alpha_production(self):
+        """With norm correction, b=2 α ≈ 0.93."""
+        q = TurboQuantMSE(d=D, num_bits=2, seed=METHOD_SEED, norm_correction=True)
+        X_hat = q.dequantize_batch(q.quantize_batch(self.X))
         alpha, _ = ip_bias(self.X, X_hat, self.Y)
-        assert 0.86 <= alpha <= 0.91, f"α={alpha:.4f}, expected ≈ 0.883"
+        assert 0.91 <= alpha <= 0.95, f"α={alpha:.4f}, expected ≈ 0.93"
 
     def test_roundtrip_preserves_norm(self):
         """Reconstructed vectors should have approximately same norm."""

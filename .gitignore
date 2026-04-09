@@ -1,0 +1,30 @@
+# IDE / Editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Testing
+.pytest_cache/
+
+# Reference implementation (not part of VQBench)
+turboquant_plus/
+
+# Environment
+.env
+*.env
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db

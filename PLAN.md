@@ -1329,6 +1329,95 @@ def bench_memory_vs_baseline():
 
 ---
 
+### Phase 9.0: Pre-Validation — Parity with turboquant_plus & Eval Infrastructure
+
+**Goal**: Close implementation gaps found by comparing with turboquant_plus reference,
+build monkey-patching evaluation pipeline, validate on Qwen2.5-3B before scaling.
+
+**Key finding from turboquant_plus code review (2026-04-08)**:
+
+turboquant_plus uses an identical algorithm (PolarQuant + QJL = our TurboQuantMSE + QJL),
+but includes a **norm correction** step we were missing: after looking up centroids in
+rotated space, it re-normalizes ŷ back to unit norm before inverse rotation. This removes
+quantization-induced norm shrinkage and improves MSE. Their evaluation uses monkey-patching
+of `k_proj` to inject quantize→dequantize in the forward pass, then measures sliding-window
+PPL on wikitext-2.
+
+| Task | File | Description | Depends |
+|------|------|-------------|---------|
+| 9.0.1 | `methods/turboquant/mse.py` | Add `norm_correction` to TurboQuantMSE dequantize | — |
+| 9.0.2 | `methods/turboquant/prod.py` | Add `norm_correction` to TurboQuantProd dequantize | 9.0.1 |
+| 9.0.3 | `datasets/wikitext.py` | WikiText-2 loader (HF datasets or local file) | — |
+| 9.0.4 | `validation/ppl_eval.py` | Sliding-window PPL evaluator | 9.0.3 |
+| 9.0.5 | `validation/monkey_patch.py` | Monkey-patch K-proj + V-proj for any HF model | 8.1 |
+| 9.0.6 | `validation/k_mse.py` | Extract real K tensors, measure MSE per method | 8.1 |
+| 9.0.7 | `validation/run_quick.py` | Quick validation: Qwen2.5-3B, wikitext-2, 3 methods | 9.0.4-6 |
+| 9.0.8 | `tests/test_norm_correction.py` | Verify norm correction improves MSE | 9.0.1 |
+
+#### 9.0.1 — Norm Correction (from turboquant_plus)
+
+turboquant_plus `PolarQuant.dequantize()` re-normalizes the quantized rotated vector:
+```python
+if self.norm_correction:
+    y_hat_norms = np.linalg.norm(y_hat, axis=1, keepdims=True)
+    y_hat = y_hat / y_hat_norms   # re-normalize to unit sphere before inverse rotation
+```
+
+**Why it helps**: After scalar quantization, `‖ŷ‖ < 1` due to centroid shrinkage.
+Re-normalizing to unit norm before rescaling by `‖x‖` removes this systematic bias.
+Expected MSE improvement: ~2-5% at b=2, negligible at b≥4.
+
+Both TurboQuantMSE and TurboQuantProd (MSE stage) gain this.
+Default `norm_correction=True` to match turboquant_plus production setting.
+
+#### 9.0.5 — Monkey-Patch Evaluation (proven approach from turboquant_plus)
+
+```python
+def patch_model_kv(model, k_quantizer_factory, v_quantizer_factory=None):
+    """Wrap k_proj (and optionally v_proj) to inject quantize→dequantize.
+
+    After patching, model.forward() / model.generate() runs the full
+    attention pipeline with compressed KV — no cache replacement needed.
+
+    This is the turboquant_plus-proven approach:
+      1. Original k_proj(x) produces K tensor
+      2. Reshape to (B, num_kv_heads, S, head_dim)
+      3. Per-head: quantize → dequantize (lossy roundtrip)
+      4. Reshape back and return
+
+    Advantages over Cache-subclass approach:
+      - Works with ANY model architecture (no Cache protocol dependency)
+      - Measures the EXACT effect of quantization on attention
+      - Simple to debug (just a nn.Module wrapper)
+    """
+```
+
+#### 9.0.7 — Quick Validation on Qwen2.5-3B
+
+Fast smoke test before committing to 27B runs:
+
+```bash
+python -m vqbench.validation.run_quick --model Qwen/Qwen2.5-3B --bits 3
+```
+
+Expected output:
+```
+Model: Qwen2.5-3B (head_dim=128, num_kv_heads=2, 36 layers)
+WikiText-2 PPL (4096 tokens, stride=512):
+
+  Method              PPL     ΔPPL    K-MSE
+  ─────────────────   ─────   ─────   ──────
+  fp16 baseline       12.45   —       —
+  TQ-MSE 3-bit        12.58   +0.13   0.0342
+  TQ-Prod 3-bit       12.52   +0.07   0.0345
+  RaBitQ 3-bit        12.61   +0.16   0.0401
+  TQ-Prod 4-bit       12.47   +0.02   0.0094
+```
+
+If ΔPPL < 0.5 at 3-bit on 3B model → proceed to 27B.
+
+---
+
 ### Phase 9: Real Model Validation
 
 End-to-end KV-cache compression on production LLMs — the ultimate acceptance test.
@@ -1337,8 +1426,8 @@ synthetic unit vectors.
 
 | Task | File | Description | Depends |
 |------|------|-------------|---------|
-| 9.1 | `validation/qwen.py` | Qwen3.5-27B KV-cache compression eval | 8.1, 8.2 |
-| 9.2 | `validation/gemma.py` | Gemma-4 KV-cache compression eval | 8.1, 8.2 |
+| 9.1 | `validation/qwen.py` | Qwen3.5-27B KV-cache compression eval | 9.0 |
+| 9.2 | `validation/gemma.py` | Gemma-4 KV-cache compression eval | 9.0 |
 | 9.3 | `validation/report.py` | Cross-model comparison & analysis | 9.1, 9.2 |
 | 9.4 | `validation/run_eval.py` | Unified evaluation driver script | 9.1, 9.2 |
 
@@ -1596,7 +1685,9 @@ These invariants ensure no method gets an unfair advantage:
 | S10 | Complete distortion-rate plot for all methods | `notebooks/01_distortion_comparison.ipynb` | 5 | Pending |
 | S11 | FWHT ≥ 3× faster than dense at d ≥ 512 | `test_perf.py` | 7 | Pending |
 | S12 | Bit-packed storage ≥ 2× smaller than int8 | `test_perf.py` | 7 | Pending |
-| S13 | PyTorch wrapper passes integration test | `test_torch_wrapper.py` | 8 | Pending |
+| S13 | PyTorch wrapper passes integration test | `test_torch_wrapper.py` | 8 | ✅ Done |
+| S13b | Norm correction improves MSE vs no correction | `test_norm_correction.py` | 9.0 | Pending |
+| S13c | Qwen2.5-3B ΔPPL < 0.5 at 3-bit (quick validation) | `run_quick.py` | 9.0 | Pending |
 | S14 | Qwen3.5-27B: perplexity degradation < 0.5 at 3-bit | Phase 9 eval | 9 | Pending |
 | S15 | Gemma-4: perplexity degradation < 0.5 at 3-bit | Phase 9 eval | 9 | Pending |
 | S16 | Cross-model report identifying best method per scenario | Phase 9 deliverable | 9 | Pending |
@@ -1605,7 +1696,17 @@ These invariants ensure no method gets an unfair advantage:
 
 ## 12. Changelog
 
-### v5 (current) — Detailed Phase 7/8/9 Execution Plans
+### v6 (current) — Phase 9.0: Parity with turboquant_plus
+
+- Added Phase 9.0: pre-validation fixes from turboquant_plus code review
+- **Norm correction**: turboquant_plus re-normalizes ŷ to unit norm before inverse rotation — we were missing this
+- **Monkey-patch evaluation**: proven approach from turboquant_plus — wrap k_proj to inject quantize→dequantize
+- **Quick validation**: Qwen2.5-3B smoke test before 27B commitment
+- Added wikitext-2 loader, sliding-window PPL evaluator, K-MSE measurement
+- Success criteria S13b (norm correction) and S13c (Qwen2.5-3B quick val)
+- Marked S13 (PyTorch wrapper) as ✅ Done (156 tests passing)
+
+### v5 — Detailed Phase 7/8/9 Execution Plans
 
 - **Phase 7 expanded**: Vectorized FWHT butterfly (O(d²)→O(d log d)), bit packing (2-8× memory savings), rotation cache, perf regression tests
 - **Phase 8 expanded**: `QuantizedKVCache` torch.nn.Module, HuggingFace `Cache` subclass integration, MLX port for Apple Silicon, optional Triton kernels

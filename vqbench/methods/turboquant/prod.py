@@ -35,9 +35,11 @@ class TurboQuantProd(VectorQuantizer):
     Paper: Zandieh et al., arXiv 2504.19874, Algorithm 2
     """
 
-    def __init__(self, d: int, num_bits: int, seed: int = 42) -> None:
+    def __init__(self, d: int, num_bits: int, seed: int = 42,
+                 norm_correction: bool = True) -> None:
         super().__init__(d, num_bits, seed)
         self._rotation = haar_rotation(d, seed)
+        self._norm_correction = norm_correction
 
         # MSE stage uses (b-1) bits; b=1 → 0 bits (pure QJL)
         self._mse_bits = max(num_bits - 1, 0)
@@ -77,6 +79,10 @@ class TurboQuantProd(VectorQuantizer):
             y = self._rotation @ x_hat              # ← rotate
             indices = np.searchsorted(self._boundaries, y).astype(np.int8)
             y_hat = self._centroids[indices]         # ← MSE reconstruction in rotated space
+            if self._norm_correction:
+                y_norm = np.linalg.norm(y_hat)
+                if y_norm > 1e-30:
+                    y_hat = y_hat / y_norm
             x_mse = x_norm * (self._rotation.T @ y_hat)  # ← back to original space
         else:
             # b=1: no MSE stage, x̃_mse = 0           ← §5.5 special case
@@ -113,6 +119,10 @@ class TurboQuantProd(VectorQuantizer):
         # MSE reconstruction
         if self._mse_bits > 0 and x_norm > 1e-30:
             y_hat = self._centroids[qv.indices]
+            if self._norm_correction:                # ← turboquant_plus parity
+                y_norm = np.linalg.norm(y_hat)
+                if y_norm > 1e-30:
+                    y_hat = y_hat / y_norm
             x_mse = x_norm * (self._rotation.T @ y_hat)
         else:
             x_mse = np.zeros(self.d)
@@ -128,3 +138,64 @@ class TurboQuantProd(VectorQuantizer):
     def storage_bits(self, qv: QuantizedVector) -> int:
         """(b-1)·d bits (MSE) + d bits (QJL signs) + 16 bits (norm) + 16 bits (γ)."""
         return self._mse_bits * self.d + self.d + 32
+
+    def quantize_batch(self, X: np.ndarray) -> list[QuantizedVector]:
+        """Vectorized batch Algorithm 2 quantization."""
+        n = len(X)
+        x_norms = np.linalg.norm(X, axis=1, keepdims=True)  # (n, 1)
+        safe_norms = np.maximum(x_norms, 1e-30)
+
+        # --- MSE stage (vectorized) ---
+        if self._mse_bits > 0:
+            X_hat = X / safe_norms                           # (n, d)
+            Y = X_hat @ self._rotation.T                     # (n, d)
+            all_indices = np.searchsorted(self._boundaries, Y).astype(np.int8)
+            Y_hat = self._centroids[all_indices]              # (n, d)
+            if self._norm_correction:
+                y_norms = np.linalg.norm(Y_hat, axis=1, keepdims=True)
+                y_norms = np.maximum(y_norms, 1e-30)
+                Y_hat = Y_hat / y_norms
+            X_mse = x_norms * (Y_hat @ self._rotation)       # (n, d)
+        else:
+            all_indices = np.zeros((n, self.d), dtype=np.int8)
+            X_mse = np.zeros_like(X)
+
+        # --- QJL stage on residuals (vectorized) ---
+        residuals = X - X_mse                                # (n, d)
+        gammas = np.linalg.norm(residuals, axis=1)           # (n,)
+        projections = residuals @ self._S.T                  # (n, d)
+        all_signs = np.sign(projections).astype(np.int8)
+        all_signs[all_signs == 0] = 1
+
+        results = []
+        for i in range(n):
+            results.append(QuantizedVector(
+                indices=all_indices[i],
+                norms=np.array([x_norms[i, 0], gammas[i]], dtype=np.float32),
+                signs=all_signs[i],
+            ))
+        return results
+
+    def dequantize_batch(self, qvs: list[QuantizedVector]) -> np.ndarray:
+        """Vectorized batch Algorithm 2 dequantization."""
+        n = len(qvs)
+        x_norms = np.array([float(qv.norms[0]) for qv in qvs])
+        gammas = np.array([float(qv.norms[1]) for qv in qvs])
+
+        # MSE reconstruction
+        if self._mse_bits > 0:
+            all_indices = np.array([qv.indices for qv in qvs])
+            Y_hat = self._centroids[all_indices]              # (n, d)
+            if self._norm_correction:
+                y_norms = np.linalg.norm(Y_hat, axis=1, keepdims=True)
+                y_norms = np.maximum(y_norms, 1e-30)
+                Y_hat = Y_hat / y_norms
+            X_mse = x_norms[:, np.newaxis] * (Y_hat @ self._rotation)
+        else:
+            X_mse = np.zeros((n, self.d))
+
+        # QJL residual
+        all_signs = np.array([qv.signs for qv in qvs], dtype=np.float64)
+        R_hat = (QJL_CONST / self.d) * gammas[:, np.newaxis] * (all_signs @ self._S)
+
+        return X_mse + R_hat

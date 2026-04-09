@@ -30,10 +30,12 @@ class TurboQuantMSE(VectorQuantizer):
     Paper: Zandieh et al., arXiv 2504.19874, Algorithm 1
     """
 
-    def __init__(self, d: int, num_bits: int, seed: int = 42) -> None:
+    def __init__(self, d: int, num_bits: int, seed: int = 42,
+                 norm_correction: bool = True) -> None:
         super().__init__(d, num_bits, seed)
         self._rotation = haar_rotation(d, seed)
         self._centroids, self._boundaries = lloyd_max_codebook(num_bits, d)
+        self._norm_correction = norm_correction
 
     @property
     def name(self) -> str:
@@ -69,12 +71,20 @@ class TurboQuantMSE(VectorQuantizer):
 
         Paper: arXiv 2504.19874, Algorithm 1, lines 5-6
         ỹ[j] = codebook[idx[j]] → x̃ = ‖x‖ · Πᵀ·ỹ
+
+        With norm_correction (turboquant_plus production setting):
+        re-normalize ŷ to unit norm before inverse rotation to remove
+        quantization-induced norm shrinkage.
         """
         x_norm = float(qv.norms[0])
         if x_norm < 1e-30:
             return np.zeros(self.d)
 
         y_hat = self._centroids[qv.indices]          # ← lookup centroids
+        if self._norm_correction:                    # ← turboquant_plus parity
+            y_norm = np.linalg.norm(y_hat)
+            if y_norm > 1e-30:
+                y_hat = y_hat / y_norm               # ← re-normalize to unit sphere
         x_hat = self._rotation.T @ y_hat             # ← inverse rotate: Πᵀ·ỹ
         return x_norm * x_hat                        # ← rescale
 
@@ -97,3 +107,16 @@ class TurboQuantMSE(VectorQuantizer):
                 norms=np.array([norms[i, 0]], dtype=np.float32),
             ))
         return results
+
+    def dequantize_batch(self, qvs: list[QuantizedVector]) -> np.ndarray:
+        """Vectorized batch dequantization with norm correction."""
+        n = len(qvs)
+        all_norms = np.array([float(qv.norms[0]) for qv in qvs])
+        all_indices = np.array([qv.indices for qv in qvs])
+        Y_hat = self._centroids[all_indices]             # (n, d)
+        if self._norm_correction:
+            y_norms = np.linalg.norm(Y_hat, axis=1, keepdims=True)
+            y_norms = np.maximum(y_norms, 1e-30)
+            Y_hat = Y_hat / y_norms                      # re-normalize each row
+        X_hat = Y_hat @ self._rotation                   # (n, d) — Πᵀ batch
+        return X_hat * all_norms[:, np.newaxis]
