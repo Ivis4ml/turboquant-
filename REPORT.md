@@ -4,9 +4,21 @@
 
 ---
 
-## 1. What We Built
+## 1. Executive Summary
 
-A unified vector quantization benchmark framework implementing **7 quantizers** under one API, with evaluation infrastructure, KV-cache compression, PyTorch/HuggingFace integration, and real-model validation.
+VQBench implements **7 vector quantizers** under a unified API and validates them on both synthetic unit-vector data and real-model K-cache tensors. The current results support a key benchmark insight:
+
+- **Low reconstruction error alone is not sufficient to predict K-cache quality.**
+- For **keys**, preserving inner products is more important than minimizing MSE.
+- For **values**, MSE remains the right objective.
+
+This points to an **asymmetric K/V strategy**: use an IP-faithful method for **K** and an MSE-oriented method for **V**. The current monkey-patched perplexity evaluation is overly pessimistic because it also quantizes current-token keys, so the next critical step is a **faithful autoregressive cache-based evaluation path**.
+
+---
+
+## 2. What We Built
+
+A unified vector quantization benchmark framework with evaluation infrastructure, KV-cache compression, PyTorch/HuggingFace integration, and real-model validation.
 
 ### Package Structure (46 Python files, ~4500 LOC)
 
@@ -43,20 +55,22 @@ vqbench/
 
 ---
 
-## 2. Key Numerical Results
+## 3. Key Numerical Results
 
-### 2.1 Normalized MSE on Synthetic Unit Vectors (d=512)
+These tables report the current benchmark measurements for the present implementation and evaluation setup. They capture the observed trends clearly, but we do **not** yet report multi-seed variance or confidence intervals.
 
-Matches paper predictions exactly.
+### 3.1 Normalized MSE on Synthetic Unit Vectors ($d = 512$)
 
-| b | TQ-MSE | TQ-Prod | RaBitQ | Lower Bound (4⁻ᵇ) |
-|---|--------|---------|--------|-------------------|
+Normalized MSE is defined as $\mathbb{E}\bigl[\lVert x - \tilde{x} \rVert^2 / \lVert x \rVert^2\bigr]$. The synthetic results closely match the predicted distortion-rate trends; the theoretical lower bound is $4^{-b}$.
+
+| $b$ | TQ-MSE | TQ-Prod | RaBitQ | Lower Bound $4^{-b}$ |
+|-----|--------|---------|--------|----------------------|
 | 1 | **0.363** | 1.57 (IP) | 0.41 | 0.25 |
 | 2 | **0.117** | 0.56 (IP) | ~0.13 | 0.0625 |
 | 3 | **0.034** | 0.18 (IP) | ~0.04 | 0.0156 |
 | 4 | **0.009** | 0.047 (IP) | ~0.012 | 0.0039 |
 
-### 2.2 Normalized K-cache MSE on Real Model (Qwen2.5-1.5B, head_dim=128, WikiText-2)
+### 3.2 Normalized K-cache MSE on Real Model (Qwen2.5-1.5B, $d_\text{head} = 128$, WikiText-2)
 
 | Method | 2-bit | 3-bit | 4-bit |
 |--------|-------|-------|-------|
@@ -64,12 +78,16 @@ Matches paper predictions exactly.
 | TQ-Prod | 0.630 | 0.186 | 0.053 |
 | RaBitQ | 0.265 | 0.058 | 0.013 |
 
-### 2.3 IP Bias (α where E[⟨y, x̃⟩] = α·⟨y, x⟩)
+### 3.3 Inner-Product Bias Factor (Expectation Form)
 
-With norm correction (production setting):
+We fit $\alpha$ in the relation
 
-| b | TQ-MSE | TQ-Prod | RaBitQ |
-|---|--------|---------|--------|
+$$\mathbb{E}\bigl[\langle y, \tilde{x} \rangle\bigr] = \alpha \cdot \langle y, x \rangle$$
+
+With norm correction enabled (production setting):
+
+| $b$ | TQ-MSE | TQ-Prod | RaBitQ |
+|-----|--------|---------|--------|
 | 1 | 0.803 | **1.0** | **1.0** |
 | 2 | 0.928 | **1.0** | **1.0** |
 | 3 | 0.977 | **1.0** | **1.0** |
@@ -77,53 +95,74 @@ With norm correction (production setting):
 
 ---
 
-## 3. Why TQ-MSE Looks "Mediocre" in Practice — Honest Analysis
+## 4. Interpretation
 
-TurboQuantMSE has provably optimal MSE among scalar quantizers (Theorem 1). Yet the real-model validation reveals that **raw MSE dominance does not translate into clear end-to-end superiority**. Here's why:
+### 4.1 Best Reconstruction Error Does Not Automatically Mean Best K-cache Quality
 
-### 3.1 TQ-MSE Wins MSE But Loses Inner Product
+Under the assumptions of TurboQuant Theorem 1, and **without** norm correction, TQ-MSE is MSE-optimal among the scalar quantizers considered there. But K-cache compression is not judged directly by reconstruction error. Attention depends on
 
-The entire point of KV-cache compression is to preserve **attention scores**: `softmax(Q·K^T/√d)·V`.
+$$\mathrm{Attn}(Q, K, V) \;=\; \mathrm{softmax}\!\left(\frac{Q K^{\top}}{\sqrt{d}}\right) V$$
 
-- Attention scores are **inner products** Q·K, not reconstructions.
-- TQ-MSE is **biased**: E[⟨q, k̃⟩] = α·⟨q, k⟩ with α < 1. At 3-bit, α ≈ 0.977 — every attention score is systematically shrunk by 2.3%. After softmax, this flattens the attention distribution (less peaky → more uniform → less focused).
-- TQ-Prod fixes this via QJL residual correction (α = 1.0), but pays with 5× higher MSE.
-- RaBitQ fixes it via ip_coeff correction (α = 1.0), with only 1.7× higher MSE.
+so for **keys**, the central object is the quality of the induced **inner products** $\langle q, k \rangle$, not the Euclidean reconstruction error $\lVert k - \tilde{k} \rVert$.
 
-**The tradeoff**: TQ-MSE gives the best reconstruction, but reconstruction isn't what attention needs. Attention needs faithful inner products.
+This is the core benchmark finding:
 
-### 3.2 The MSE Gap Shrinks at Higher Bits
+- **TQ-MSE wins on reconstruction MSE**
+- **TQ-Prod and RaBitQ win on inner-product unbiasedness**
 
-| b | TQ-MSE | RaBitQ | TQ-MSE advantage |
-|---|--------|--------|-----------------|
-| 2 | 0.119 | 0.265 | 2.2× better |
-| 3 | 0.034 | 0.058 | 1.7× better |
-| 4 | 0.009 | 0.013 | 1.4× better |
+That is not a contradiction. It is a **metric-task mismatch**.
 
-At 4-bit (the practical sweet spot), TQ-MSE is only 1.4× better in MSE than RaBitQ. But RaBitQ has **unbiased IP**. For the attention computation, 1.4× MSE improvement may matter less than eliminating the 0.4% IP bias.
+### 4.2 K and V Should Be Evaluated Differently
 
-### 3.3 Norm Correction Muddies the Story
+Keys and values play different roles in attention:
 
-Adding norm correction (re-normalizing ŷ to unit norm before inverse rotation, matching turboquant_plus production):
+- **K cache** affects attention logits through inner products.
+- **V cache** is consumed through a linear weighted sum, so reconstruction fidelity is the more natural objective.
 
-- **Reduces IP bias** (α = 0.64 → 0.80 at 1-bit) — significant improvement
-- **Increases MSE** slightly at low bits (0.363 → 0.404 at 1-bit)
-- At 3+ bits: negligible MSE difference, meaningful α improvement
+This suggests an asymmetric interpretation of the current results:
 
-This means the production TQ-MSE is **not** the theoretically optimal MSE quantizer anymore — it's a compromise between MSE and IP quality. The Lloyd-Max optimality claim (Theorem 1) applies to the **non-corrected** variant.
+- For **K**, IP fidelity is the critical metric.
+- For **V**, MSE is still the right metric.
 
-### 3.4 For V Cache, TQ-MSE Is the Clear Winner
+This is why a method can look dominant under MSE while still being less compelling for K-cache than its raw reconstruction numbers suggest.
 
-Values in attention are linearly combined: `output = softmax(scores) · V`. Here, MSE is the right metric — no inner products involved. TQ-MSE's Lloyd-Max optimal codebook gives the best V cache compression at every bit-width.
+### 4.3 TQ-MSE Shrinks Attention Logits in Expectation
 
-**Practical recommendation** (matching turboquant_plus production):
-- **K cache → TQ-Prod** (unbiased IP for attention scores)
-- **V cache → TQ-MSE** (lowest MSE for value reconstruction)
-- This asymmetric K/V strategy is what turboquant_plus uses and what the paper recommends.
+TQ-MSE remains biased in the inner-product sense:
 
-### 3.5 RaBitQ Is a Strong Competitor
+- At 3-bit, $\alpha \approx 0.977$
+- At 4-bit, $\alpha \approx 0.996$
 
-RaBitQ deserves more credit than the TurboQuant paper gives it:
+So the precise statement is:
+
+- **In expectation**, attention logits are multiplicatively shrunk by $\alpha$, i.e. $\mathbb{E}[\langle q, \tilde{k} \rangle] = \alpha \cdot \langle q, k \rangle$ with $\alpha < 1$
+- This can flatten the attention distribution after softmax
+
+TQ-Prod and RaBitQ remove this multiplicative bias ($\alpha = 1$) by construction, but they do so with different reconstruction costs.
+
+### 4.4 The RaBitQ Gap Narrows at Higher Bits
+
+| $b$ | TQ-MSE | RaBitQ | TQ-MSE advantage |
+|-----|--------|--------|-----------------|
+| 2 | 0.119 | 0.265 | $2.2\times$ better |
+| 3 | 0.034 | 0.058 | $1.7\times$ better |
+| 4 | 0.009 | 0.013 | $1.4\times$ better |
+
+At higher bit-widths, TQ-MSE still has the best MSE, but the gap narrows materially. This suggests that, for **K-cache**, eliminating systematic IP bias may matter more than the remaining MSE gap, especially at practical bit-widths such as 4-bit.
+
+That is still a **hypothesis supported by current evidence**, not a finalized end-to-end conclusion. To validate it, we need faithful autoregressive cache-based evaluation.
+
+### 4.5 Norm Correction Changes the Object Being Compared
+
+Adding norm correction, to match `turboquant_plus` production behavior:
+
+- improves IP bias substantially at low bits
+- slightly worsens MSE at low bits
+- has little MSE impact at $b \geq 3$ while still improving $\alpha$
+
+This means the production TQ-MSE variant is no longer exactly the theorem's object. It is a practical compromise between reconstruction fidelity and IP behavior, which is the right engineering choice, but it narrows how strongly we should phrase the pure optimality claim.
+
+### 4.6 RaBitQ Is a Strong Practical Baseline
 
 | Aspect | TQ-MSE | TQ-Prod | RaBitQ |
 |--------|--------|---------|--------|
@@ -131,28 +170,38 @@ RaBitQ deserves more credit than the TurboQuant paper gives it:
 | IP bias | Biased | Unbiased | Unbiased |
 | Metadata overhead | 16 bits | 32 bits | 64 bits |
 | Simplicity | Simple | Complex (2-stage) | Simple |
-| IP estimation | Direct (biased) | QJL correction | ip_coeff correction |
+| IP estimation | Direct (biased) | QJL correction | `ip_coeff` correction |
 
-RaBitQ achieves unbiased IP with a **simpler** mechanism (one scalar correction) than TQ-Prod (full d-dimensional QJL stage). Its MSE is 1.7× worse than TQ-MSE at 3-bit, but this may not matter for the attention application.
+Our current results suggest that RaBitQ is a stronger practical baseline than a pure MSE-only comparison would imply:
 
-### 3.6 The Real Bottleneck: Evaluation Methodology
+- it preserves unbiased inner products
+- it stays much closer to TQ-MSE in MSE at higher bits
+- it achieves this with a relatively simple correction mechanism
 
-Our monkey-patching PPL evaluation (wrapping k_proj to inject quantize→dequantize) gives **catastrophic PPL numbers** (ΔPPL = +60 to +7700). This is NOT because the quantizers are bad — it's because the evaluation quantizes ALL token positions including the current one.
+What is still missing is a unified end-to-end accounting of **effective storage cost**, including metadata, rather than comparing only nominal bit-widths.
 
-In real KV-cache compression (llama.cpp, MLX):
-- Current token: exact K (no quantization)
-- Past tokens: quantized K (dequantized on read)
-- Most attention weight goes to nearby tokens → quantization error in distant past has low impact
+### 4.7 The Main Remaining Risk Is Evaluation Methodology
 
-The monkey-patching approach makes the current token's K also quantized, which destroys attention quality. This is why turboquant_plus's own monkey-patching benchmark also shows bad PPL (494 on Qwen2.5-0.5B at 3-bit).
+The current monkey-patching PPL evaluation gives catastrophic perplexity numbers, but the setup is not faithful to real KV-cache compression.
 
-**For Phase 9**: proper PPL evaluation requires either (a) autoregressive cache-based inference, or (b) llama.cpp/MLX integration. Normalized K-MSE is a valid proxy metric.
+In the current path:
+
+- the model's **current-token** key is also quantized
+- all token positions are perturbed through the same injected `quantize -> dequantize` path
+
+In real autoregressive KV-cache compression:
+
+- the **current token** is exact
+- only **past cached tokens** are quantized
+- distant-token errors are weighted through the actual attention pattern
+
+So the current PPL results are best interpreted as an overly pessimistic stress test, not as the true downstream quality of cache compression.
 
 ---
 
-## 4. Comparison with turboquant_plus
+## 5. Comparison with `turboquant_plus`
 
-Cross-validated against turboquant_plus (the reference implementation):
+Cross-validated against `turboquant_plus` as the reference implementation:
 
 | Aspect | VQBench | turboquant_plus |
 |--------|---------|----------------|
@@ -167,13 +216,19 @@ Cross-validated against turboquant_plus (the reference implementation):
 
 ---
 
-## 5. What's Next (Phase 9)
+## 6. Next Critical Steps
 
-For real-model PPL validation on Qwen3.5-27B and Gemma-4:
+The next phase is not just more engineering. It is about making the evaluation path faithfully match the actual deployment setting.
 
-1. **Build autoregressive cache evaluator** — process tokens one at a time, compress KV to cache, decompress only past tokens for attention
-2. **Or integrate with llama.cpp/MLX** — use production quantization path for accurate PPL numbers
-3. **Focus on the asymmetric K/V strategy**: TQ-Prod for K (unbiased IP) + TQ-MSE for V (lowest MSE)
-4. **Test at head_dim=128 (Qwen) and head_dim=256 (Gemma)** — larger head_dim should favor TQ-MSE due to stronger concentration of measure
+1. **Build an autoregressive cache evaluator**
+   Process tokens one at a time, keep current-token KV exact, and quantize only the stored past cache.
+2. **Add task-proxy metrics for K-cache**
+   Report attention-logit correlation, top-k overlap, or rank preservation in addition to MSE.
+3. **Account for metadata in a unified storage metric**
+   Convert nominal bit-width plus side information into effective bits per vector or compression ratio.
+4. **Add variance reporting**
+   Include repeated runs or dataset slices so trend claims can be stated with uncertainty bounds.
+5. **Evaluate the asymmetric K/V strategy directly**
+   Test IP-faithful quantization for K and MSE-oriented quantization for V on Qwen and Gemma settings.
 
-The normalized K-MSE results (matching paper predictions within 1%) give confidence that the quantizers are correct. The remaining work is plumbing — getting the quantized values into the right place in the inference pipeline.
+The current numerical results, together with the reference-implementation checks, give confidence that the quantizers themselves are implemented correctly. The key open problem is now **faithful downstream evaluation**.
