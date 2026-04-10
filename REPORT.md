@@ -229,7 +229,7 @@ The key observation: the metadata cost is **fixed per vector** but depends stron
    
    These cost nothing per-vector but dominate for very small caches. At $n = 1000$ vectors with $d = 128$, the rotation matrix amortizes to 1050 bits/vector — meaningful. At $n = 100{,}000$, it's 10.5 bits/vector — negligible. None of these numbers appear in the tables above; a complete accounting is an open item in §6.3.
 
-6. **Caveat on RaBitQ metadata width.** Our RaBitQ implementation stores $\lVert o \rVert$ and $\text{ip\_coeff}$ as fp32 (following the reference), while TurboQuant uses fp16 norms. Dropping RaBitQ's metadata to fp16 would save 32 bits/vector, bringing ExtRaBitQ 3-bit at head_dim = 128 from 512 to 480 bits (eff. 3.75 bits/dim, 4.27× vs fp16). We have not changed the defaults because it would deviate from the reference paper, but it narrows the practical gap.
+6. **Caveat on RaBitQ metadata width.** Our RaBitQ implementation stores $\lVert o \rVert$ and `ip_coeff` as fp32 (following the reference), while TurboQuant uses fp16 norms. Dropping RaBitQ's metadata to fp16 would save 32 bits/vector, bringing ExtRaBitQ 3-bit at head_dim = 128 from 512 to 480 bits (eff. 3.75 bits/dim, 4.27× vs fp16). We have not changed the defaults because it would deviate from the reference paper, but it narrows the practical gap.
 
 **Reproduction.** Run:
 
