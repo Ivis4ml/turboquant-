@@ -169,8 +169,8 @@ Every quantizer in VQBench exposes a `storage_bits(qv)` method returning the **e
 | TQ-MSE | $b \cdot d$ | $16$ | $b \cdot d + 16$ | $\lVert x \rVert$ as fp16 |
 | TQ-Prod | $b \cdot d$ | $32$ | $b \cdot d + 32$ | $\lVert x \rVert$ + $\gamma$ as fp16 |
 | QJL (1-bit only) | $d$ | $16$ | $d + 16$ | $\gamma = \lVert x \rVert$ as fp16 |
-| RaBitQ (1-bit) | $d$ | $64$ | $d + 64$ | $\lVert o \rVert$ + $\text{ip\_coeff}$ as fp32 |
-| ExtRaBitQ | $B \cdot d$ | $128$ | $B \cdot d + 128$ | $\lVert o \rVert$ + ip_coeff + scale + offset, all fp32 |
+| RaBitQ (1-bit) | $d$ | $64$ | $d + 64$ | $\lVert o \rVert$ + `ip_coeff` as fp32 |
+| ExtRaBitQ | $B \cdot d$ | $128$ | $B \cdot d + 128$ | $\lVert o \rVert$ + `ip_coeff` + `scale` + `offset`, all fp32 |
 | PQ | $m \cdot \lceil \log_2 k \rceil$ | $16$ | $m \cdot \log_2 k + 16$ | $\lVert x \rVert$ as fp16 |
 
 The key observation: the metadata cost is **fixed per vector** but depends strongly on the method. This makes "nominal bit-width" misleading — a "3-bit" ExtRaBitQ vector actually costs 3.25 effective bits/dim at head_dim=128 because of its 128-bit metadata header.
