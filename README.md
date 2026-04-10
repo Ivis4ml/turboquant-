@@ -2,19 +2,21 @@
 
 > Unified Vector Quantization Benchmark: TurboQuant, RaBitQ, and Product Quantization under a single Python API.
 >
-> **Status:** Research prototype. Core quantizers are implemented, cross-validated against the reference `turboquant_plus`, and verified on synthetic and real-model data. The evaluation story (faithful autoregressive PPL, variance reporting, scale validation) is still in progress — see [`REPORT.md`](REPORT.md).
+> **Status:** Research prototype. Core quantizers are implemented, cross-validated against the reference `turboquant_plus`, and verified on synthetic and real-model data. Faithful streaming PPL is now in place and validated on Qwen3-4B (head_dim = 128) and Qwen3.5-4B (head_dim = 256), with near-lossless 4-bit K/V on the latter. Qwen3.5-27B validation, variance reporting, and task-proxy metrics are the remaining open items — see [`REPORT.md`](REPORT.md).
 
 ---
 
 ## What's inside
 
-Seven quantizers implementing a common `VectorQuantizer` ABC:
+Eight quantizers implementing a common `VectorQuantizer` ABC:
 
 | Family | Methods | Papers |
 |---|---|---|
-| **TurboQuant** | `TurboQuantMSE`, `QJLQuantizer`, `TurboQuantProd` | Zandieh et al., arXiv 2504.19874 / 2406.03482 |
+| **TurboQuant** | `TurboQuantMSE`, `QJLQuantizer`, `TurboQuantProd`, `BlockTurboQuantMSE` | Zandieh et al., arXiv 2504.19874 / 2406.03482 |
 | **RaBitQ** | `RaBitQ1Bit`, `ExtRaBitQ` | Gao & Long, arXiv 2405.12497 / 2409.09913 |
 | **Product Quant** | `ProductQuantizer`, `OptimizedPQ` | Jégou et al., TPAMI 2011; Ge et al., CVPR 2013 |
+
+`BlockTurboQuantMSE` (B = 16 / 32 / 64) extends scalar TurboQuantMSE with per-block fp16 scales — see [`BlockTQ.md`](BlockTQ.md) for the algorithm walkthrough and [`REPORT.md`](REPORT.md) §3.5.5 for the Qwen3-4B quality numbers.
 
 Plus infrastructure:
 
@@ -22,8 +24,8 @@ Plus infrastructure:
 - `vqbench.kv_cache` — pluggable K/V compressor, compressed attention, outlier strategy
 - `vqbench.eval` — distortion / bias / recall / speed / compression sweeps
 - `vqbench.torch_wrapper` — `QuantizedKVCache` as a drop-in `transformers` 5.5.0 `Cache` subclass
-- `vqbench.validation` — monkey-patch PPL, real K-MSE measurement, WikiText-2 loader
-- 160 passing tests cross-validating correctness against paper predictions and `turboquant_plus`
+- `vqbench.validation` — faithful streaming PPL (`streaming_ppl.py`), monkey-patch PPL, real K-MSE, WikiText-2 loader
+- 186 passing tests cross-validating correctness against paper predictions and `turboquant_plus`
 
 Read [`REPORT.md`](REPORT.md) for the honest benchmark findings, the metric-task mismatch discussion, and the list of what is still missing.
 
@@ -68,7 +70,7 @@ Apple Silicon (M-series) uses `mps`; CUDA is not yet tested but the torch path i
 python -m pytest vqbench/tests/ -v
 ```
 
-Expected: **160 passed, 1 skipped**, ≈ 20 seconds on Apple M5 Pro.
+Expected: **186 passed, 1 skipped**, ≈ 31 seconds on Apple M5 Pro.
 
 Subset runs for faster iteration:
 
@@ -186,14 +188,21 @@ print(f'Storage: {q.storage_bits(qv)} bits  (fp32 = {32*128} bits)')
 
 ```python
 from vqbench.methods.turboquant.mse import TurboQuantMSE
-from vqbench.methods.turboquant.prod import TurboQuantProd
+from vqbench.methods.turboquant.block_mse import BlockTurboQuantMSE
 from vqbench.kv_cache.compressor import KVCacheCompressor
 
-# Asymmetric K/V strategy (§4.2 of REPORT.md):
-# K needs unbiased inner products → TQ-Prod
-# V needs lowest MSE → TQ-MSE
-key_q = TurboQuantProd(d=128, num_bits=3, seed=42)
-val_q = TurboQuantMSE(d=128, num_bits=3, seed=42)
+# Recommended K/V strategy (REPORT.md §3.5.2, §3.5.5):
+# In the direct-dequant path that a standard attention module uses, both K and
+# V are best served by MSE-optimal scalar quantization. TQ-Prod's unbiased-IP
+# guarantee only holds in its dedicated estimator path (not exercised by HF
+# attention). On Qwen2.5-0.5B, direct-dequant TQ-Prod is 27× worse than TQ-MSE
+# at 4-bit K — see REPORT.md §3.5.2c.
+#
+# K: BlockTurboQuantMSE for outlier-prone head_dim 64-128, scalar TurboQuantMSE
+#    for head_dim ≥ 256 where block quantization is unnecessary.
+# V: scalar TurboQuantMSE at any head_dim (V compression is essentially free).
+key_q = BlockTurboQuantMSE(d=128, num_bits=4, block_size=16, seed=42)
+val_q = TurboQuantMSE(d=128, num_bits=4, seed=42)
 
 comp = KVCacheCompressor(key_q, val_q)
 comp.compress(keys, values)  # (seq_len, 128) numpy arrays
@@ -213,9 +222,9 @@ tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
 
 cache = apply_quantized_cache(
     model,
-    method_key="TurboQuantProd",
+    method_key="BlockTurboQuantMSE-B16",   # or "TurboQuantMSE" for head_dim ≥ 256
     method_value="TurboQuantMSE",
-    num_bits=3,
+    num_bits=4,
 )
 
 # Note: current integration is batch=1 only; see REPORT.md §2 scope notes.
@@ -232,9 +241,9 @@ out = model.generate(ids, max_new_tokens=20, past_key_values=cache)
 Four layers:
 
 - **Core** — rotation, codebook, metrics, packing, base ABC
-- **Methods** — 7 quantizers across three families under a common interface
+- **Methods** — 8 quantizers across three families under a common interface
 - **Applications** — KV cache compressor, compressed attention, torch wrapper, eval suite
-- **Pipeline** — recommended asymmetric K/V compression (§4.2 of REPORT.md)
+- **Pipeline** — recommended K/V compression strategy (§3.5.2 and §3.5.5 of REPORT.md)
 
 ---
 
@@ -242,15 +251,16 @@ Four layers:
 
 This is a research prototype. Specifically:
 
-1. **Monkey-patched PPL is a pessimistic stress test, not a faithful measurement.** It quantizes every K position including the current token; real KV-cache compression only quantizes past tokens. See REPORT.md §4.7.
+1. **Faithful streaming PPL is in place** (REPORT.md §3.5, `vqbench/validation/streaming_ppl.py`). The older monkey-patched PPL path is still shipped as a pessimistic stress test but is no longer the measurement of record — see REPORT.md §4.7.
 2. **HF cache integration processes `batch = 0` only.** Batched generation is not yet supported.
-3. **Multi-bit RaBitQ estimator (`ext_rabitq_ip_estimate`) is present but not validated at $\alpha \approx 1$.** Only the 1-bit estimator is test-verified unbiased.
-4. **No variance / confidence intervals on any numbers in REPORT.md.** Single-run point estimates only.
-5. **Scale validation stops at Qwen2.5-1.5B.** Nothing tested on 7B+ or on long-context tasks.
-6. **No production quantization path.** No MLX, llama.cpp, CUDA, or Triton kernels. The NumPy → PyTorch bridge has CPU ↔ GPU transfer overhead.
-7. **FWHT doesn't beat BLAS at $d \leq 512$** — the vectorized FWHT is correct but NumPy's BLAS matmul is heavily optimized. FWHT's asymptotic $O(d \log d)$ advantage would show at $d \geq 2048$.
+3. **Hybrid-attention models** (Qwen3.5 series — 8 full_attention + 24 linear_attention layers) currently use monkey-patching for the full-attention K projection; a native `VQBenchCache` that passes through linear-attention state is pending.
+4. **Multi-bit RaBitQ estimator (`ext_rabitq_ip_estimate`) is present but not validated at $\alpha \approx 1$.** Only the 1-bit estimator is test-verified unbiased.
+5. **No variance / confidence intervals on any numbers in REPORT.md.** Single-run point estimates only.
+6. **Scale validation now covers Qwen3-4B and Qwen3.5-4B.** Qwen3.5-27B is the final target and is gated only on inference speed (AWQ int4 on MPS, ~4–8 hours for a full sweep). See REPORT.md §3.5.8.
+7. **No production quantization path.** No MLX, llama.cpp, CUDA, or Triton kernels. The NumPy → PyTorch bridge has CPU ↔ GPU transfer overhead.
+8. **FWHT doesn't beat BLAS at $d \leq 512$** — the vectorized FWHT is correct but NumPy's BLAS matmul is heavily optimized. FWHT's asymptotic $O(d \log d)$ advantage would show at $d \geq 2048$.
 
-All of these are tracked as open items in REPORT.md §6.
+All of these are tracked as open items in REPORT.md §6 and [`TODO.md`](TODO.md).
 
 ---
 
@@ -275,15 +285,15 @@ VQBench extends `turboquant_plus` with:
 vqbench/
 ├── core/           base.py, rotation.py, metrics.py, packing.py
 ├── methods/
-│   ├── turboquant/ codebook.py, mse.py, qjl.py, prod.py
+│   ├── turboquant/ codebook.py, mse.py, qjl.py, prod.py, block_mse.py
 │   ├── rabitq/     rabitq_1bit.py, rabitq_ext.py, estimator.py
 │   └── pq/         product_quant.py, opq.py
 ├── eval/           distortion.py, bias.py, recall.py, speed.py, compression.py
 ├── kv_cache/       compressor.py, attention.py, outlier.py
 ├── torch_wrapper/  module.py, hook.py          # transformers 5.5.0 Cache
-├── validation/     ppl_eval.py, monkey_patch.py, k_mse.py, run_quick.py
+├── validation/     ppl_eval.py, monkey_patch.py, k_mse.py, run_quick.py, streaming_ppl.py
 ├── datasets/       synthetic.py, wikitext.py
-└── tests/          11 test files, 160 passing tests
+└── tests/          13 test files, 186 passing tests
 ```
 
 ---

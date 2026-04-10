@@ -5,6 +5,8 @@
 > and demonstrates KV-cache compression as the primary application.
 >
 > This is the single source of truth for all implementation work.
+>
+> **For current project status, known limitations, and the collaborator-facing TODO list, see [`TODO.md`](TODO.md).** PLAN.md describes the design and phased roadmap; TODO.md tracks what is done, what is broken, and what is next.
 
 ---
 

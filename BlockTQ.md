@@ -61,13 +61,13 @@ K std = 30.7
 
 旋转 $\Pi$ 能把 outlier 分散到所有坐标上吗？理论上能，但效果取决于 $d$：
 
-| head_dim | 旋转后坐标分布 | 集中度 | 实际效果 |
+| head_dim | 旋转后坐标分布 | 集中度 | 实际效果（4-bit scalar TQ-MSE, WikiText-2） |
 |---|---|---|---|
-| 512+ | 非常接近 $\mathcal{N}(0, 1/d)$ | 强 | 论文理论成立 |
-| 128 | 接近但有 heavy tail | 中等 | 勉强可用 |
-| 64 | 偏离 Gaussian 明显 | 弱 | 崩溃 |
+| 256 (Qwen3.5-4B) | 几乎完美 $\mathcal{N}(0, 1/d)$ | 极强 | **lossless**: ΔPPL = 0.00 / 0.0% |
+| 128 (Qwen3-4B) | 接近 $\mathcal{N}(0, 1/d)$，heavy tail 很弱 | 强 | **production viable**: ΔPPL = +0.14 / +1.1% |
+| 64 (Qwen2.5-0.5B) | 偏离 Gaussian 明显 | 弱 | **崩溃**: ΔPPL = +4.43 / +31.8% |
 
-**结论：旋转分散 outlier 的能力随 $d$ 增大而增强，但在 $d=64$-$128$ 范围内不够强，real K tensor 的 outlier 结构仍然残留在旋转后的坐标里。**
+**结论：旋转分散 outlier 的能力随 $d$ 增大而增强。在 $d=64$ 彻底崩溃；在 $d=128$ 已经 production 可用，block quantization 可以把它再拉一档（+0.14 → +0.09）；在 $d=256$ scalar 已经 lossless，block 带不来额外收益。Block quantization 是 outlier 隔离的通用改进，但它的"必要性"强烈依赖于 head_dim。**
 
 ---
 
@@ -190,6 +190,17 @@ turboquant_plus 的 `turbo4 = 4.25 bits/val` 对应我们的 Block B=64。
 | **Block B=32** | **4** | **4** | **+0.13 (+1.3%)** | **62% better** |
 
 **长 context 下 B=32 反超 B=16**，因为更多 cache 边界放大了 fp16 scale 的舍入误差累积。B=32 只有 4 个 scale（4 次舍入），B=16 有 8 个（8 次舍入）。
+
+### Qwen3.5-4B (head_dim=256, hybrid attention), WikiText-2, 512 tokens
+
+| 方法 | K bits | V bits | ΔPPL | 相对 scalar |
+|---|---|---|---|---|
+| **Scalar TQ-MSE** | **4** | **4** | **+0.00 (+0.0%)** | **已经 lossless** |
+| Block B=64 | 4 | 4 | +0.00 (+0.0%) | 相同 |
+| Scalar TQ-MSE | 3 | 4 | +0.08 (+0.8%) | 基线 |
+| Block B=32 | 3 | 4 | +0.00 (+0.0%) | lossless 3-bit |
+
+**在 head_dim=256，scalar 4-bit 已经 lossless，block quantization 无必要。** 3-bit 下 block B=32 把 ΔPPL 从 +0.8% 压到 0。这是 `BlockTQ` 的"帮助但不是救命"区间。
 
 ---
 

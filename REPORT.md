@@ -32,21 +32,21 @@ The `Block B=64 4-bit` config matches `turboquant_plus`'s published `turbo4 = 4.
 
 A unified vector quantization benchmark framework with evaluation infrastructure, KV-cache compression, PyTorch/HuggingFace integration, and real-model validation.
 
-### Package Structure (46 Python files, ~4500 LOC)
+### Package Structure (56 Python files, ~5800 LOC)
 
 ```
 vqbench/
 ├── core/           base.py, rotation.py, metrics.py, packing.py
 ├── methods/
-│   ├── turboquant/ codebook.py, mse.py, qjl.py, prod.py
+│   ├── turboquant/ codebook.py, mse.py, qjl.py, prod.py, block_mse.py
 │   ├── rabitq/     rabitq_1bit.py, rabitq_ext.py, estimator.py
 │   └── pq/         product_quant.py, opq.py
 ├── eval/           distortion.py, bias.py, recall.py, speed.py, compression.py
 ├── kv_cache/       compressor.py, attention.py, outlier.py
 ├── torch_wrapper/  module.py, hook.py
-├── validation/     ppl_eval.py, monkey_patch.py, k_mse.py, run_quick.py
+├── validation/     ppl_eval.py, monkey_patch.py, k_mse.py, run_quick.py, streaming_ppl.py
 ├── datasets/       synthetic.py, wikitext.py
-└── tests/          11 test files, 160 passing tests
+└── tests/          13 test files, 186 passing tests
 ```
 
 ![alt text](VQ.png)
@@ -64,6 +64,7 @@ vqbench/
 | 7 | Performance: vectorized FWHT, bit packing, batch ops, rotation cache | ✅ |
 | 8 | PyTorch wrapper + HuggingFace transformers `Cache` integration | ✅ (see scope note below) |
 | 9.0 | Norm correction (turboquant_plus parity) + real-model validation | ✅ (see scope note below) |
+| 9.1 | Block quantization + faithful streaming PPL + Qwen3.5 validation | ✅ (see scope note below) |
 
 **Phase 8 scope (honest).** The `QuantizedKVCache` / `VQBenchCache` integration with the `transformers` 5.5.0 `Cache` protocol is correct for **single-batch autoregressive inference** — the `update()` path in `vqbench/torch_wrapper/module.py` explicitly processes `batch = 0` only (see the comment in `module.py`). This is the right scope for validation work on one prompt at a time, but:
 
@@ -71,7 +72,9 @@ vqbench/
 - no CUDA / Triton / MLX kernels — the quantize→dequantize path goes CPU ↔ GPU via NumPy
 - no speed claims are made against fp16 baseline yet
 
-**Phase 9.0 scope (honest).** What is done: norm correction added to match `turboquant_plus` production setting; normalized K-cache MSE measured offline on real Qwen2.5-1.5B activations; the monkey-patched PPL path is built but is explicitly a pessimistic stress test (§4.7). What is **not** done: autoregressive cache-faithful PPL, task-proxy metrics, variance reporting, scale validation on 27B+. These are the open items in §6.
+**Phase 9.0 scope (honest).** What is done: norm correction added to match `turboquant_plus` production setting; normalized K-cache MSE measured offline on real Qwen2.5-1.5B activations; the monkey-patched PPL path is built but is explicitly a pessimistic stress test (§4.7).
+
+**Phase 9.1 scope (honest).** What is done: faithful streaming PPL evaluator (§3.5, `streaming_ppl.py`) with verified chunk-invariance; `BlockTurboQuantMSE` with per-block fp16 scales (§3.5.5); validation on Qwen3-4B (head_dim = 128) and Qwen3.5-4B (head_dim = 256, hybrid attention). What is **not** done: task-proxy metrics, variance reporting, scale validation on 27B+, and a `VQBenchCache` that handles hybrid attention architectures natively. These are the open items in §6.
 
 ---
 
@@ -248,7 +251,7 @@ print_compression_table(results)
 
 ### 3.5 Faithful Streaming PPL — Real End-to-End Measurement
 
-**Headline (added 2026-04-09):** at the correct architectural scale — **Qwen3-4B, head_dim = 128** — scalar TurboQuantMSE at 4-bit K/V gives **ΔPPL = +0.14 (+1.1%)**, and the new `BlockTurboQuantMSE` at B = 16, 4-bit K/V gives **ΔPPL = +0.09 (+0.7%)**. These numbers are in the same ballpark as `turboquant_plus`'s published `turbo4` (+0.23%) on a comparable model. See §3.5.6 for the full table. The earlier-reported catastrophic numbers on Qwen2.5-0.5B (§3.5.1) were specific to head_dim = 64 — at head_dim = 128 and above, the paper algorithm already works, and block quantization makes it meaningfully better.
+**Headline (added 2026-04-09):** at the correct architectural scale — **Qwen3-4B, head_dim = 128** — scalar TurboQuantMSE at 4-bit K/V gives **ΔPPL = +0.14 (+1.1%)**, and the new `BlockTurboQuantMSE` at B = 16, 4-bit K/V gives **ΔPPL = +0.09 (+0.7%)**. These numbers are in the same ballpark as `turboquant_plus`'s published `turbo4` (+0.23%) on a comparable model. See §3.5.5 for the full table. The earlier-reported catastrophic numbers on Qwen2.5-0.5B (§3.5.1) were specific to head_dim = 64 — at head_dim = 128 and above, the paper algorithm already works, and block quantization makes it meaningfully better.
 
 
 The monkey-patched PPL results in earlier drafts of this report quantized every token position including the current chunk, which is strictly worse than production KV-cache compression. §4.7 called that "a pessimistic stress test, not a measurement."
@@ -282,7 +285,7 @@ Range: 0.017 (0.14%). Every chunk size scores **exactly 511 tokens** (seq_len �
 
 #### 3.5.1 Quality curve — Qwen2.5-0.5B (head_dim 64, WikiText-2, 512 tokens, chunk 256)
 
-**Important context:** this model's `head_dim = 64` is smaller than the regime where the paper algorithm is designed to be most effective (see §3.5.6 for results at head_dim = 128). The numbers below show the paper algorithm under stress, NOT a fair comparison to `turboquant_plus`'s production implementation.
+**Important context:** this model's `head_dim = 64` is smaller than the regime where the paper algorithm is designed to be most effective (see §3.5.5 for results at head_dim = 128). The numbers below show the paper algorithm under stress, NOT a fair comparison to `turboquant_plus`'s production implementation.
 
 All numbers from the corrected evaluator. Reproducible via the script in §3.5.4 (runs in ~90s on M5 Pro).
 
@@ -300,7 +303,7 @@ All numbers from the corrected evaluator. Reproducible via the script in §3.5.4
 
 The TQ-Prod and ExtRaBitQ rows use the **direct dequantize path** — not the estimator path — because that is what a HuggingFace attention module sees when it calls `cache.update()` and then does `Q @ K.transpose(-1, -2)`. See §3.3 and §4.1 for why this matters.
 
-**Reading this table correctly.** The +30% numbers here reflect paper-algorithm TurboQuantMSE at a head_dim where the N(0, 1/d) coordinate-distribution approximation is weakest. §3.5.6 shows what happens at head_dim = 128 (Qwen3-4B) where the algorithm is in its intended regime — ΔPPL drops to +1.1% for scalar and +0.7% for block, which **is** comparable to `turboquant_plus`'s published numbers.
+**Reading this table correctly.** The +30% numbers here reflect paper-algorithm TurboQuantMSE at a head_dim where the N(0, 1/d) coordinate-distribution approximation is weakest. §3.5.5 shows what happens at head_dim = 128 (Qwen3-4B) where the algorithm is in its intended regime — ΔPPL drops to +1.1% for scalar and +0.7% for block, which **is** comparable to `turboquant_plus`'s published numbers.
 
 #### 3.5.2 Three honest findings from these numbers
 
@@ -336,6 +339,8 @@ The gap between "paper algorithm in Python" and "llama.cpp production implementa
 None of these are present in VQBench. The Python path in `turboquant_plus/benchmarks/benchmark_ppl_tq_vs_rq.py` is also missing them — which is why `turboquant_plus` itself reports its good quality numbers via `llama-server`, not via its Python benchmark.
 
 **Upshot.** Our faithful cache-based PPL is the **correct measurement path for the VQBench implementation as it stands**, but matching production-grade quality numbers would require implementing block quantization on top. That is a meaningful piece of future work, explicitly tracked in §6.
+
+> **Update (§3.5.5–3.5.7).** After running Qwen3-4B (head_dim = 128) and Qwen3.5-4B (head_dim = 256), **head_dim turned out to be the dominant factor**, not block quantization. At head_dim = 128 the scalar paper algorithm already gives ΔPPL = +1.1% and block quantization takes it down to +0.7%. At head_dim = 256 the scalar paper algorithm is already near-lossless (ΔPPL = 0.0% at 4-bit), and block quantization is unnecessary. The catastrophic numbers in §3.5.1 were specific to Qwen2.5-0.5B's head_dim = 64, which is out of the theory's intended regime. Block quantization is still a real improvement on outlier-prone activations (§3.5.5), but it is not the load-bearing fix the draft above claimed it to be.
 
 #### 3.5.4 Reproduction
 
@@ -428,7 +433,7 @@ TQ-Prod K4 / TQ-MSE V4:   PPL=117.6298 d=+105.2499
 ExtRaBitQ K4/V4:          PPL=17.1484  d=+4.7685
 ```
 
-#### 3.5.6 Qwen3-4B (head_dim 128) — Block Quantization Results
+#### 3.5.5 Qwen3-4B (head_dim 128) — Block Quantization Results
 
 **This is where the algorithm is supposed to work.** Qwen3-4B has head_dim = 128 —
 the regime where the TurboQuant paper's concentration-of-measure arguments
@@ -473,7 +478,7 @@ than the embedding fanout).
 
 Block B=16 costs ~0.88 extra effective bits/dim compared to scalar, in exchange for a 37% ΔPPL reduction. Block B=32 costs 0.38 extra bits/dim for a 18% ΔPPL reduction. For `turboquant_plus`'s reported `turbo4 = 4.25 bits/val`, the comparable VQBench config is **BlockTQ-MSE B=32 4-bit at 4.50 bits/dim**, delivering +0.9% ΔPPL.
 
-#### 3.5.7 Qwen3.5-4B (head_dim 256, hybrid attention) — Near-Lossless Compression
+#### 3.5.6 Qwen3.5-4B (head_dim 256, hybrid attention) — Near-Lossless Compression
 
 **This is the strongest result in the report.** Qwen3.5-4B has head_dim = 256 and a hybrid architecture where only 8 of 32 layers use standard full attention with KV cache; the remaining 24 layers use linear attention with fixed-size recurrent state (~26 MB total, context-independent).
 
@@ -515,7 +520,7 @@ Block B=16 costs ~0.88 extra effective bits/dim compared to scalar, in exchange 
 
 These are different models and evaluation setups, so this is not an apple-to-apple comparison. But at matching storage budgets (same bits/val), the VQBench paper algorithm on Qwen3.5 achieves comparable or better quality than `turboquant_plus`'s published llama.cpp numbers.
 
-#### 3.5.8 Why head_dim matters so much — the dimension scaling story
+#### 3.5.7 Why head_dim matters so much — the dimension scaling story
 
 Collecting the 4-bit Scalar TQ-MSE results across three models:
 
@@ -531,11 +536,11 @@ Qwen3.5's hybrid architecture adds a second effect: only 25% of layers contribut
 
 **Implication for Qwen3.5-27B:** it has the same head_dim=256 and the same hybrid architecture ratio. The per-layer quantization quality should be identical to Qwen3.5-4B. More layers (64 vs 32) means more accumulation, but the 25% full-attention ratio limits this. **We predict ΔPPL ≈ 0% at 4-bit and < 1% at 3-bit.**
 
-#### 3.5.5 Qwen3.5-27B Projection and Deployment Plan
+#### 3.5.8 Qwen3.5-27B Projection and Deployment Plan
 
 **Architecture (estimated from Qwen3.5-4B scaling):** head_dim = 256, ~64 layers (~16 full_attention + ~48 linear_attention), num_kv_heads = 4–8.
 
-**Quality projection:** Qwen3.5-27B shares head_dim = 256 and the hybrid attention architecture with Qwen3.5-4B. Per-layer quantization quality should be identical (same head_dim → same N(0, 1/256) concentration). More layers means more error accumulation, but only 25% of layers contribute to KV cache. **We predict ΔPPL ≈ 0% at 4-bit and < 1% at 3-bit**, based on §3.5.7 and §3.5.8.
+**Quality projection:** Qwen3.5-27B shares head_dim = 256 and the hybrid attention architecture with Qwen3.5-4B. Per-layer quantization quality should be identical (same head_dim → same N(0, 1/256) concentration). More layers means more error accumulation, but only 25% of layers contribute to KV cache. **We predict ΔPPL ≈ 0% at 4-bit and < 1% at 3-bit**, based on §3.5.6 and §3.5.7.
 
 **Memory budget on M5 Pro 48 GB:**
 
@@ -658,7 +663,7 @@ Our current results suggest that RaBitQ is a stronger practical baseline than a 
 
 What is still missing is a unified end-to-end accounting of **effective storage cost**, including metadata, rather than comparing only nominal bit-widths.
 
-### 4.7 Evaluation Methodology — Now Partially Fixed
+### 4.7 Evaluation Methodology — Fixed
 
 An earlier draft of this report used a **monkey-patched** PPL evaluator that wrapped the model's `k_proj` to inject `quantize → dequantize` in the forward pass. That path quantized every token position including the current chunk, which is strictly worse than real KV-cache compression. It produced catastrophic numbers (ΔPPL in the thousands) that were explicitly labeled "pessimistic stress test, not measurement."
 
@@ -673,10 +678,12 @@ This report now additionally includes **§3.5's faithful streaming PPL evaluator
 **What changed in §4's story.** The qualitative claims of §4.1–§4.6 stand (metric-task mismatch, asymmetric K/V roles, RaBitQ as a strong baseline), but §3.5.2(c) empirically contradicts one specific prediction: on real Qwen2.5 K tensors at 4-bit symmetric, TQ-Prod loses badly to TQ-MSE despite TQ-Prod's unbiased-IP guarantee. The budget-split cost (TQ-Prod uses $b - 1$ bits for MSE + 1 bit for QJL) dominates the bias-correction benefit at practical bit-widths. This is a real finding and a warning that the synthetic IP-bias tables in §3.3 are not a substitute for downstream task measurement.
 
 **What's still missing** (see §6):
-1. **Block quantization** — our scalar quantization uses one norm per head-dim vector, while `turboquant_plus`'s production path uses per-block scales. This is the main quality gap. §3.5.3.
-2. **Scale validation** beyond Qwen2.5-1.5B. Qwen3.5-27B is the intended target. §3.5.5.
+1. **Scale validation on Qwen3.5-27B.** Algorithm and evaluator are ready; gated only on inference speed (AWQ int4 on MPS). See §3.5.8.
+2. **Native hybrid-attention `VQBenchCache`.** Qwen3.5-4B results in §3.5.6 currently use monkey-patching on the full-attention layers; a native cache that compresses only full-attention K/V while passing through linear-attention state is the clean integration.
 3. **Task-proxy metrics** (attention-logit correlation, top-k overlap). §6.
 4. **Variance / CI reporting.** Single-run numbers throughout. §6.
+
+(Block quantization and the faithful streaming PPL evaluator, which earlier drafts listed as "missing," have both shipped in Phase 9.1 — see the completed table in §6.)
 
 ---
 
@@ -721,15 +728,15 @@ The VQBench numbers on Qwen3.5-4B are better than turboquant_plus's published nu
 | Item | Status |
 |------|--------|
 | Faithful autoregressive cache evaluator | ✅ §3.5, `streaming_ppl.py` |
-| Block / group quantization | ✅ §3.5.6–7, `BlockTurboQuantMSE` |
+| Block / group quantization | ✅ §3.5.5–6, `BlockTurboQuantMSE` |
 | Streaming PPL evaluator bug fix | ✅ §3.5, `test_streaming_ppl.py` |
-| Qwen3-4B validation (head_dim=128) | ✅ §3.5.6 |
-| Qwen3.5-4B validation (head_dim=256) | ✅ §3.5.7 |
+| Qwen3-4B validation (head_dim=128) | ✅ §3.5.5 |
+| Qwen3.5-4B validation (head_dim=256) | ✅ §3.5.6 |
 | bits/val parity with turboquant_plus | ✅ §5.2 |
 
 ### Remaining
 
-1. **Run Qwen3.5-27B** — the final headline target. Algorithm is ready; needs AWQ int4 weights to fit M5 Pro 48 GB. Estimated 4–8 hours. See §3.5.5 for the deployment plan and memory projection.
+1. **Run Qwen3.5-27B** — the final headline target. Algorithm is ready; needs AWQ int4 weights to fit M5 Pro 48 GB. Estimated 4–8 hours. See §3.5.8 for the deployment plan and memory projection.
 2. **VQBenchCache for hybrid attention** — current faithful cache evaluator uses monkey-patching for Qwen3.5 (which has mixed full_attention + linear_attention layers). A proper `VQBenchCache` that compresses only full_attention layers' K,V while passing through linear_attention state unchanged would be the complete integration.
 3. **Add task-proxy metrics for K-cache** — attention-logit correlation, top-k overlap, or rank preservation. These give a cheaper signal than full PPL and could reveal when IP bias matters vs when MSE dominates.
 4. **Add variance reporting** — all numbers in this report are single-run point estimates. Multi-seed or multi-slice reporting would strengthen the claims.
