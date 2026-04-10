@@ -31,6 +31,7 @@ def _get_method_class(name: str) -> type[VectorQuantizer]:
     from vqbench.methods.turboquant.mse import TurboQuantMSE
     from vqbench.methods.turboquant.prod import TurboQuantProd
     from vqbench.methods.turboquant.qjl import QJLQuantizer
+    from vqbench.methods.turboquant.block_mse import BlockTurboQuantMSE
     from vqbench.methods.rabitq.rabitq_1bit import RaBitQ1Bit
     from vqbench.methods.rabitq.rabitq_ext import ExtRaBitQ
 
@@ -38,6 +39,19 @@ def _get_method_class(name: str) -> type[VectorQuantizer]:
         "TurboQuantMSE": TurboQuantMSE,
         "TurboQuantProd": TurboQuantProd,
         "QJL": QJLQuantizer,
+        "BlockTurboQuantMSE": BlockTurboQuantMSE,
+        "BlockTurboQuantMSE-B16": lambda d, num_bits, seed=42: BlockTurboQuantMSE(
+            d=d, num_bits=num_bits, block_size=16, seed=seed,
+        ),
+        "BlockTurboQuantMSE-B20": lambda d, num_bits, seed=42: BlockTurboQuantMSE(
+            d=d, num_bits=num_bits, block_size=20, seed=seed,
+        ),
+        "BlockTurboQuantMSE-B32": lambda d, num_bits, seed=42: BlockTurboQuantMSE(
+            d=d, num_bits=num_bits, block_size=32, seed=seed,
+        ),
+        "BlockTurboQuantMSE-B40": lambda d, num_bits, seed=42: BlockTurboQuantMSE(
+            d=d, num_bits=num_bits, block_size=40, seed=seed,
+        ),
         "RaBitQ1Bit": RaBitQ1Bit,
         "ExtRaBitQ": ExtRaBitQ,
     }
@@ -102,7 +116,16 @@ class QuantizedKVCache(nn.Module):
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compress and append new KV pairs, return decompressed for attention.
+        Faithful autoregressive KV-cache update.
+
+        Past tokens (from previous update() calls on this layer) are served from
+        compressed storage — they carry quantization error. Current-call tokens
+        (key_states / value_states) are returned EXACTLY and only compressed
+        AFTER this call so they become lossy on the next read.
+
+        This matches the llama.cpp `-ctk turbo*` semantics.
+
+        Note: single-batch inference only (`batch = 0`).
 
         Args:
             key_states: (batch, num_kv_heads, seq_len, head_dim)
@@ -110,22 +133,33 @@ class QuantizedKVCache(nn.Module):
             layer_idx: Transformer layer index.
 
         Returns:
-            (all_keys, all_values): Decompressed full cache tensors,
+            (full_keys, full_values): past (lossy) ++ current (exact),
             shape (batch, num_kv_heads, total_seq, head_dim).
         """
         device = key_states.device
         dtype = key_states.dtype
         batch_size = key_states.shape[0]
 
-        # Process batch=0 only for now (single-batch inference)
+        # Step 1: read past cache state (decompressed) BEFORE adding this chunk
+        past_k, past_v = self.get(
+            layer_idx, device=device, dtype=dtype, batch_size=batch_size,
+        )
+
+        # Step 2: concat past (lossy) + current (EXACT) for this step's attention
+        if past_k.shape[2] == 0:
+            full_k, full_v = key_states, value_states
+        else:
+            full_k = torch.cat([past_k, key_states], dim=2)
+            full_v = torch.cat([past_v, value_states], dim=2)
+
+        # Step 3: compress and store the current chunk for the NEXT call
         k_np = key_states[0].detach().cpu().to(torch.float64).numpy()  # (heads, seq, d)
         v_np = value_states[0].detach().cpu().to(torch.float64).numpy()
-
         for h in range(self.num_kv_heads):
             comp = self._compressors[layer_idx][h]
-            comp.compress(k_np[h], v_np[h])  # (seq, d)
+            comp.compress(k_np[h], v_np[h])
 
-        return self.get(layer_idx, device=device, dtype=dtype, batch_size=batch_size)
+        return full_k, full_v
 
     def get(
         self,

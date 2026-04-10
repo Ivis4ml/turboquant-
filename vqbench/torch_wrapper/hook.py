@@ -61,17 +61,42 @@ class VQBenchCacheLayer(CacheLayerMixin):
         *args,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compress new KV, return decompressed full cache."""
+        """
+        Faithful autoregressive KV-cache behavior:
+
+        - Past tokens (from previous update() calls): served from compressed storage,
+          decompressed on read. These carry quantization error.
+        - Current tokens (this call's key_states / value_states): returned EXACTLY,
+          as if they had never been quantized. They will be compressed AFTER this
+          call so they're only lossy the NEXT time they're read.
+
+        This matches what llama.cpp does with `-ctk turbo3`: the attention for the
+        current step uses exact K, only past cache entries are quantized.
+        """
         device = key_states.device
         dtype = key_states.dtype
+        batch_size = key_states.shape[0]
 
+        # Step 1: read past (decompressed) BEFORE adding this chunk
+        past_k, past_v = self._get_all(device, dtype, batch_size=batch_size)
+
+        # Step 2: concat past (lossy) + current (EXACT) for this step's attention
+        if past_k.shape[2] == 0:
+            full_k, full_v = key_states, value_states
+        else:
+            full_k = torch.cat([past_k, key_states], dim=2)
+            full_v = torch.cat([past_v, value_states], dim=2)
+
+        # Step 3: AFTER the attention output is computed, store compressed
+        # current chunk for future reads. In the transformers Cache protocol
+        # update() returns before attention runs, so we just compress now —
+        # the compressed copy won't be read again until the NEXT update() call.
         k_np = key_states[0].detach().cpu().to(torch.float64).numpy()
         v_np = value_states[0].detach().cpu().to(torch.float64).numpy()
-
         for h in range(self.num_kv_heads):
             self._compressors[h].compress(k_np[h], v_np[h])
 
-        return self._get_all(device, dtype, batch_size=key_states.shape[0])
+        return full_k, full_v
 
     def _get_all(
         self, device: torch.device, dtype: torch.dtype, batch_size: int = 1,
@@ -111,9 +136,13 @@ class VQBenchCacheLayer(CacheLayerMixin):
         pass
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
-        """Return (cache_length, sliding_window_length) for attention mask."""
-        seq_len = self.get_seq_length()
-        return seq_len, seq_len
+        """
+        Return (kv_length, kv_offset) — matches DynamicLayer contract.
+        Called BEFORE update(), so get_seq_length() returns the past length.
+        Total mask length = past + new query length.
+        """
+        past_length = self.get_seq_length()
+        return past_length + query_length, 0
 
 
 class VQBenchCache(Cache):

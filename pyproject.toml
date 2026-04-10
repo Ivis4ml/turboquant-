@@ -16,7 +16,19 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0", "pytest-timeout>=2.2"]
-all = ["matplotlib>=3.8", "jupyter>=1.0"]
+# Real-model validation: required to run `python -m vqbench.validation.run_quick`
+validation = [
+    "torch>=2.4",
+    "transformers>=5.5.0",
+    "datasets>=3.0",
+    "tokenizers>=0.20",
+    "safetensors>=0.4",
+]
+notebook = ["matplotlib>=3.8", "jupyter>=1.0"]
+# Everything
+all = [
+    "vqbench[test,validation,notebook]",
+]
 
 [tool.setuptools.packages.find]
 include = ["vqbench*"]

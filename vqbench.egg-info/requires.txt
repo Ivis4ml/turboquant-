@@ -2,9 +2,19 @@ numpy>=1.26
 scipy>=1.12
 
 [all]
+vqbench[notebook,test,validation]
+
+[notebook]
 matplotlib>=3.8
 jupyter>=1.0
 
 [test]
 pytest>=8.0
 pytest-timeout>=2.2
+
+[validation]
+torch>=2.4
+transformers>=5.5.0
+datasets>=3.0
+tokenizers>=0.20
+safetensors>=0.4

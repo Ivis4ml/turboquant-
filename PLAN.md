@@ -1418,18 +1418,173 @@ If ΔPPL < 0.5 at 3-bit on 3B model → proceed to 27B.
 
 ---
 
-### Phase 9: Real Model Validation
+### Phase 9.0.5: Critical Evaluator Bug Fix (COMPLETED)
 
-End-to-end KV-cache compression on production LLMs — the ultimate acceptance test.
-This phase proves that VQBench methods work on real attention patterns, not just
-synthetic unit vectors.
+Discovered during review: the initial streaming PPL evaluator passed `labels=input_ids`
+to HF causal LM, which internally does `shift_logits / shift_labels` — this silently
+drops one scored token per chunk boundary and over-counts the denominator. Result:
+baseline PPL drifted with chunk size (12.365 / 12.407 / 12.391 for chunk 512/256/128),
+which is the **definitive symptom** of a broken streaming evaluator.
+
+**Fix:** manual per-token cross-entropy with explicit boundary handling — `prev_last_logit`
+from one chunk is used to score the first token of the next chunk. Implementation in
+`vqbench/validation/streaming_ppl.py`. Locked down by 5 tests in
+`vqbench/tests/test_streaming_ppl.py`:
+
+- `test_n_scored_equals_seq_len_minus_one` — correct token counting
+- `test_baseline_chunk_invariance` — exact baseline varies <1% across chunk sizes
+- `test_single_chunk_quantized_equals_baseline` — bit-identical in single-chunk mode
+- `test_first_update_returns_current_exact` — first update() returns input as-is
+- `test_second_update_current_is_exact_past_is_lossy` — past/current contract
+
+After fix, chunk-invariance is 0.14% (down from 0.34%) on Qwen2.5-0.5B 512 tokens,
+and n_scored is a constant 511 for all chunk sizes.
+
+### Phase 9.1: Block Quantization — Closing the Gap to Production Quality (NEW TOP PRIORITY)
+
+**Motivation.** The faithful streaming PPL evaluator (§9.0.5) shows a large gap between
+our paper-algorithm TurboQuantMSE and `turboquant_plus`'s production `llama.cpp -ctk turbo*`
+path on the same algorithm family:
+
+| Metric | VQBench (paper algorithm) | turboquant_plus (llama.cpp turbo4) |
+|---|---|---|
+| Qwen2.5-0.5B, 4-bit symmetric | +31.8% ΔPPL | +0.23% (different model, comparable head_dim) |
+
+The gap is **not** a numerical bug in our quantizers — we have 1e-6 parity with
+`turboquant_plus`'s own Python TurboQuantMSE. The gap is in the **storage layout**
+our algorithm uses:
+
+- **VQBench today:** one scalar L2 norm per full head-dim vector, single global Lloyd-Max
+  codebook on the rotated coordinates
+- **llama.cpp production:** block-wise quantization with a **per-block fp16 scale**
+  on blocks of 32 or 64 consecutive coordinates
+
+With per-block scales, each block handles its own dynamic range, and outlier coordinates
+in one block don't destroy the centroids of another block. This is the single most
+important structural change to close the quality gap.
 
 | Task | File | Description | Depends |
 |------|------|-------------|---------|
-| 9.1 | `validation/qwen.py` | Qwen3.5-27B KV-cache compression eval | 9.0 |
-| 9.2 | `validation/gemma.py` | Gemma-4 KV-cache compression eval | 9.0 |
-| 9.3 | `validation/report.py` | Cross-model comparison & analysis | 9.1, 9.2 |
-| 9.4 | `validation/run_eval.py` | Unified evaluation driver script | 9.1, 9.2 |
+| 9.1.1 | `methods/turboquant/block_mse.py` | `BlockTurboQuantMSE(d, num_bits, block_size=32)` | Phase 2 |
+| 9.1.2 | `methods/turboquant/block_prod.py` | `BlockTurboQuantProd` (block MSE + per-block QJL) | 9.1.1 |
+| 9.1.3 | `methods/__init__.py` | Register block variants in `QUANTIZERS` dict | 9.1.1, 9.1.2 |
+| 9.1.4 | `tests/test_block_quant.py` | Correctness + storage + parity with scalar variant at block_size=d | 9.1.1 |
+| 9.1.5 | `eval/compression.py` | Extend storage accounting to include per-block scale bits | 9.1.1 |
+| 9.1.6 | `validation/streaming_ppl.py` | Run Qwen2.5-0.5B sweep with block variants, compare to scalar | 9.1.1 |
+
+#### 9.1.1 — `BlockTurboQuantMSE` design
+
+```python
+class BlockTurboQuantMSE(VectorQuantizer):
+    """
+    Block-wise TurboQuantMSE with per-block fp16 scale.
+
+    For head_dim = 128 with block_size = 32:
+      4 blocks per vector, each with its own fp16 scale + b-bit indices.
+      Storage: 4 * (32*b + 16) = 128*b + 64 bits = 4.5 bits/dim at b=4.
+
+    Per-block Lloyd-Max codebook can either be:
+      (a) shared across blocks, computed once for the unit Gaussian
+          (simpler, no per-block training)
+      (b) computed once for the expected in-block distribution
+          (the block dist is close to N(0, 1/block_size) after rotation)
+
+    We use (b): rotation → normalize per block → scalar quantize with
+    block-size-specific codebook.
+    """
+
+    def __init__(self, d, num_bits, block_size=32, seed=42, norm_correction=True):
+        assert d % block_size == 0
+        self.block_size = block_size
+        self.num_blocks = d // block_size
+        self._rotation = haar_rotation(d, seed)
+        # Codebook for Lloyd-Max on N(0, 1/block_size) — NOT 1/d
+        self._centroids, self._boundaries = lloyd_max_codebook(num_bits, block_size)
+        super().__init__(d, num_bits, seed)
+
+    def quantize(self, x):
+        # 1. Rotate (same as TurboQuantMSE)
+        y = self._rotation @ x
+        # 2. Split into blocks
+        blocks = y.reshape(self.num_blocks, self.block_size)
+        # 3. Per-block norm extraction + quantization
+        scales = np.linalg.norm(blocks, axis=1) + 1e-30  # (num_blocks,)
+        y_normed = blocks / scales[:, None]  # each block is unit-norm
+        indices = np.searchsorted(self._boundaries, y_normed).astype(np.int8)
+        return QuantizedVector(
+            indices=indices.flatten(),
+            norms=scales.astype(np.float16),   # per-block fp16 scales
+            metadata={"block_size": self.block_size},
+        )
+
+    def dequantize(self, qv):
+        indices = qv.indices.reshape(self.num_blocks, self.block_size)
+        scales = qv.norms.astype(np.float64)  # (num_blocks,)
+        y_blocks = self._centroids[indices]
+        if self.norm_correction:
+            y_blocks = y_blocks / (np.linalg.norm(y_blocks, axis=1, keepdims=True) + 1e-30)
+        y = (y_blocks * scales[:, None]).flatten()
+        return self._rotation.T @ y
+
+    def storage_bits(self, qv):
+        # per-block: block_size * num_bits (data) + 16 (fp16 scale)
+        return self.num_blocks * (self.block_size * self.num_bits + 16)
+```
+
+#### 9.1.2 — Hypothesis being tested
+
+**H1:** at head_dim = 128, block_size = 32, b = 4, `BlockTurboQuantMSE` will reduce
+ΔPPL on Qwen3-4B from ~+30% (scalar) to under +2% (closer to `turboquant_plus` turbo4).
+
+**H2:** block_size = 64 is a reasonable middle ground. `block_size < 16` adds too much
+metadata overhead; `block_size > 64` loses the outlier-isolation benefit.
+
+**H3:** the V cache does not need block quantization. Single-norm TQ-MSE on V continues
+to be essentially free, so only the K path needs this work.
+
+#### 9.1.3 — Storage comparison at head_dim = 128, $b = 4$
+
+| Method | Bits/vector | Eff. bits/dim | vs fp16 |
+|---|---|---|---|
+| TQ-MSE scalar, 4-bit | $4 \cdot 128 + 16 = 528$ | 4.12 | 3.88× |
+| **BlockTQ-MSE, 4-bit, block=32** | $4 \cdot 128 + 4 \cdot 16 = 576$ | 4.50 | 3.56× |
+| BlockTQ-MSE, 4-bit, block=64 | $4 \cdot 128 + 2 \cdot 16 = 544$ | 4.25 | 3.76× |
+
+Block quantization costs ~0.1-0.4 effective bits/dim compared to scalar, in exchange
+for (hypothetically) dramatically better quality. This matches `turboquant_plus`'s
+`turbo4 = 4.25 bits/val`.
+
+### Phase 9.2: Real Model Validation — Qwen3.5 Series (was Qwen2.5)
+
+**Target change:** validation models updated from Qwen2.5 to the latest Qwen3.5 series.
+
+| Model | Purpose | Weights | Fits 48 GB M5 Pro? |
+|---|---|---|---|
+| **Qwen3.5-4B** (≈ `Qwen/Qwen3-4B`) | Fast iteration, validation, debugging | ~8 GB fp16 | ✅ very comfortable |
+| Qwen3.5-14B | Intermediate validation | ~28 GB fp16 | ✅ fits |
+| **Qwen3.5-27B** | **Final headline target** | ~54 GB fp16 | ❌ needs int4 (~18 GB) |
+
+**Qwen3.5-27B on M5 Pro 48 GB:** requires AWQ int4 pre-quantized weights
+(`autoawq` package; kernels fall back to dequantize-then-matmul on MPS, so expect
+2-5× slower forward passes than native fp16). Estimated full sweep time: 4-8 hours.
+
+| Task | File | Description | Depends |
+|------|------|-------------|---------|
+| 9.2.1 | `validation/run_quick.py` | Update default model to `Qwen/Qwen3-4B` | 9.1 |
+| 9.2.2 | `validation/qwen35_4b.py` | Full sweep on Qwen3-4B with block variants | 9.1, 9.2.1 |
+| 9.2.3 | `validation/qwen35_27b.py` | Final run on Qwen3-32B-AWQ (closest to Qwen3.5-27B) | 9.2.2 |
+| 9.2.4 | `validation/report.py` | Generate `turboquant_plus`-style quality/speed table | 9.2.3 |
+
+### Phase 9.3: (original Phase 9) Real Model Validation on Qwen3.5-27B
+
+End-to-end KV-cache compression on production LLMs — the ultimate acceptance test.
+
+| Task | File | Description | Depends |
+|------|------|-------------|---------|
+| 9.3.1 | `validation/qwen.py` | Qwen3.5-27B KV-cache compression eval | 9.2 |
+| 9.3.2 | `validation/gemma.py` | Gemma-4 KV-cache compression eval (deferred) | 9.2 |
+| 9.3.3 | `validation/report.py` | Cross-model comparison & analysis | 9.3.1, 9.3.2 |
+| 9.3.4 | `validation/run_eval.py` | Unified evaluation driver script | 9.3.1, 9.3.2 |
 
 #### 9.1 / 9.2 — Per-Model Evaluation Protocol
 
@@ -1686,9 +1841,10 @@ These invariants ensure no method gets an unfair advantage:
 | S11 | FWHT ≥ 3× faster than dense at d ≥ 512 | `test_perf.py` | 7 | Pending |
 | S12 | Bit-packed storage ≥ 2× smaller than int8 | `test_perf.py` | 7 | Pending |
 | S13 | PyTorch wrapper passes integration test | `test_torch_wrapper.py` | 8 | ✅ Done |
-| S13b | Norm correction improves MSE vs no correction | `test_norm_correction.py` | 9.0 | Pending |
-| S13c | Qwen2.5-3B ΔPPL < 0.5 at 3-bit (quick validation) | `run_quick.py` | 9.0 | Pending |
-| S14 | Qwen3.5-27B: perplexity degradation < 0.5 at 3-bit | Phase 9 eval | 9 | Pending |
+| S13a | Streaming PPL evaluator chunk-invariant (< 1%) | `test_streaming_ppl.py` | 9.0.5 | ✅ Done |
+| S13b | VQBenchCache past-lossy / current-exact contract | `test_streaming_ppl.py` | 9.0.5 | ✅ Done |
+| S13c | `BlockTurboQuantMSE` 4-bit Qwen3-4B ΔPPL < 2% | Phase 9.1 | 9.1 | Pending |
+| S14 | Qwen3.5-27B (AWQ int4 weights) 4-bit K / 3-bit V ΔPPL < 1% | Phase 9.3 eval | 9.3 | Pending |
 | S15 | Gemma-4: perplexity degradation < 0.5 at 3-bit | Phase 9 eval | 9 | Pending |
 | S16 | Cross-model report identifying best method per scenario | Phase 9 deliverable | 9 | Pending |
 
@@ -1696,7 +1852,15 @@ These invariants ensure no method gets an unfair advantage:
 
 ## 12. Changelog
 
-### v6 (current) — Phase 9.0: Parity with turboquant_plus
+### v7 (current) — Evaluator fix, block quantization plan, Qwen3.5 target
+
+- **Phase 9.0.5**: fixed a critical bug in `streaming_ppl.py` — HF's `labels=` shortcut silently drops one token per chunk boundary via `shift_logits / shift_labels`. Replaced with manual per-token CE using `prev_last_logit` to score boundary tokens.
+- Added 5 new tests in `tests/test_streaming_ppl.py` locking down: n_scored correctness, chunk-invariance of exact baseline, single-chunk bit-identical, past-lossy / current-exact contract.
+- **Phase 9.1**: new top-priority phase — `BlockTurboQuantMSE` with per-block fp16 scales on blocks of 32-64 coordinates. This is the single most impactful structural change to close the gap between paper-algorithm (`+30%` ΔPPL) and production-quality (`+0.23%`) KV-cache compression.
+- **Phase 9.2**: validation targets updated from Qwen2.5 series to **Qwen3.5 series**. Intermediate: `Qwen3-4B` (fits 48 GB M5 Pro at fp16). Final: `Qwen3.5-27B` (fits at AWQ int4 ~18 GB).
+- Renumbered the original Phase 9 as Phase 9.3.
+
+### v6 — Phase 9.0: Parity with turboquant_plus
 
 - Added Phase 9.0: pre-validation fixes from turboquant_plus code review
 - **Norm correction**: turboquant_plus re-normalizes ŷ to unit norm before inverse rotation — we were missing this
