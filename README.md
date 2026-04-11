@@ -208,7 +208,7 @@ comp = KVCacheCompressor(key_q, val_q)
 comp.compress(keys, values)  # (seq_len, 128) numpy arrays
 k_hat = comp.get_keys()
 v_hat = comp.get_values()
-print(f'Compression ratio: {comp.compression_ratio():.1f}x')
+print(f'Compression ratio: {comp.compression_ratio():.1f}x (vs fp16)')
 ```
 
 ### Drop-in transformers Cache

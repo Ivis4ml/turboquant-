@@ -76,6 +76,13 @@ class VQBenchCacheLayer(CacheLayerMixin):
         device = key_states.device
         dtype = key_states.dtype
         batch_size = key_states.shape[0]
+        if batch_size != 1:
+            raise ValueError(
+                f"VQBenchCacheLayer.update() requires batch_size == 1, got {batch_size}. "
+                "Batched generation is not supported — each sequence would need its "
+                "own per-head compressors. Call model.generate() with a single "
+                "sequence at a time."
+            )
 
         # Step 1: read past (decompressed) BEFORE adding this chunk
         past_k, past_v = self._get_all(device, dtype, batch_size=batch_size)
@@ -192,6 +199,7 @@ class VQBenchCache(Cache):
         return total_bits // 8
 
     def compression_ratio(self) -> float:
+        """Compression ratio vs fp16 KV-cache storage (matches KVCacheCompressor and QuantizedKVCache)."""
         total_tokens = sum(
             comp.num_tokens
             for layer in self.layers

@@ -29,14 +29,17 @@ def _get_all_quantizers():
     X_train = random_unit_vectors(N_TRAIN, D, seed=DATA_SEED + 100)
 
     quantizers = []
-    for cls in [TurboQuantMSE, TurboQuantProd, QJLQuantizer]:
+    for cls in [TurboQuantMSE, TurboQuantProd]:
         q = cls(d=D, num_bits=2, seed=METHOD_SEED)
         quantizers.append(q)
 
-    for cls in [RaBitQ1Bit]:
-        q = cls(d=D, seed=METHOD_SEED)
-        q.fit(X_train)
-        quantizers.append(q)
+    # QJL and RaBitQ1Bit are 1-bit-only — instantiating them at num_bits=2
+    # used to silently coerce to 1 bit; they now raise ValueError.
+    quantizers.append(QJLQuantizer(d=D, num_bits=1, seed=METHOD_SEED))
+
+    rq = RaBitQ1Bit(d=D, num_bits=1, seed=METHOD_SEED)
+    rq.fit(X_train)
+    quantizers.append(rq)
 
     ext = ExtRaBitQ(d=D, num_bits=2, seed=METHOD_SEED)
     ext.fit(X_train)

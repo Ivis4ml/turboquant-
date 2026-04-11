@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from vqbench.torch_wrapper.module import QuantizedKVCache
+from vqbench.torch_wrapper.module import QuantizedKVCache, _get_method_class
 from vqbench.torch_wrapper.hook import VQBenchCache, make_vqbench_cache
 
 HEAD_DIM = 128
@@ -108,6 +108,43 @@ class TestQuantizedKVCache:
         assert k_out.dtype == torch.bfloat16
         assert v_out.dtype == torch.bfloat16
 
+    def test_update_rejects_batch_gt_one(self):
+        """batch_size != 1 must raise instead of silently corrupting batches > 0."""
+        cache = QuantizedKVCache(
+            head_dim=HEAD_DIM, num_kv_heads=NUM_KV_HEADS,
+            num_layers=1, num_bits_key=2, num_bits_value=2,
+        )
+        k = torch.randn(2, NUM_KV_HEADS, SEQ_LEN, HEAD_DIM)
+        v = torch.randn(2, NUM_KV_HEADS, SEQ_LEN, HEAD_DIM)
+        with pytest.raises(ValueError, match="batch_size == 1"):
+            cache.update(k, v, layer_idx=0)
+
+    def test_get_rejects_batch_gt_one(self):
+        cache = QuantizedKVCache(
+            head_dim=HEAD_DIM, num_kv_heads=NUM_KV_HEADS,
+            num_layers=1, num_bits_key=2, num_bits_value=2,
+        )
+        with pytest.raises(ValueError, match="batch_size == 1"):
+            cache.get(layer_idx=0, batch_size=2)
+
+    def test_block_b64_registered(self):
+        """BlockTurboQuantMSE-B64 is the headline Qwen3.5-4B config — registry must expose it."""
+        cls = _get_method_class("BlockTurboQuantMSE-B64")
+        q = cls(d=256, num_bits=4, seed=0)
+        assert q.block_size == 64
+
+        cache = QuantizedKVCache(
+            head_dim=256, num_kv_heads=2,
+            num_layers=1,
+            method_key="BlockTurboQuantMSE-B64",
+            method_value="TurboQuantMSE",
+            num_bits_key=4, num_bits_value=4,
+        )
+        k = torch.randn(1, 2, 16, 256)
+        v = torch.randn(1, 2, 16, 256)
+        k_out, _ = cache.update(k, v, layer_idx=0)
+        assert k_out.shape == (1, 2, 16, 256)
+
 
 class TestVQBenchCache:
     def test_is_cache_subclass(self):
@@ -153,6 +190,16 @@ class TestVQBenchCache:
         cache.layers[0].update(k, v)
         cache.reset()
         assert cache.get_seq_length() == 0
+
+    def test_layer_update_rejects_batch_gt_one(self):
+        cache = VQBenchCache(
+            head_dim=HEAD_DIM, num_kv_heads=NUM_KV_HEADS,
+            num_layers=1,
+        )
+        k = torch.randn(2, NUM_KV_HEADS, SEQ_LEN, HEAD_DIM)
+        v = torch.randn(2, NUM_KV_HEADS, SEQ_LEN, HEAD_DIM)
+        with pytest.raises(ValueError, match="batch_size == 1"):
+            cache.layers[0].update(k, v)
 
 
 class TestMakeVQBenchCache:

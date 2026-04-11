@@ -31,6 +31,11 @@ class QJLQuantizer(VectorQuantizer):
     """
 
     def __init__(self, d: int, num_bits: int = 1, seed: int = 42) -> None:
+        if num_bits != 1:
+            raise ValueError(
+                f"QJLQuantizer is a 1-bit-only method, got num_bits={num_bits}. "
+                "For multi-bit unbiased IP, use TurboQuantProd."
+            )
         super().__init__(d, num_bits=1, seed=seed)
         # S matrix: S_{ij} ~ N(0,1), independent from rotation Π
         # Use a different seed stream to ensure independence

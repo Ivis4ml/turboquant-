@@ -36,6 +36,11 @@ class RaBitQ1Bit(VectorQuantizer):
     """
 
     def __init__(self, d: int, num_bits: int = 1, seed: int = 42) -> None:
+        if num_bits != 1:
+            raise ValueError(
+                f"RaBitQ1Bit is a 1-bit-only method, got num_bits={num_bits}. "
+                "For multi-bit RaBitQ, use ExtRaBitQ."
+            )
         super().__init__(d, num_bits=1, seed=seed)
         self._rotation = haar_rotation(d, seed)
         self._centroid: np.ndarray | None = None  # set via fit()

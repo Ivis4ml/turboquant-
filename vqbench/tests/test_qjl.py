@@ -65,3 +65,9 @@ class TestQJL:
         qv = q.quantize(np.zeros(D))
         x_hat = q.dequantize(qv)
         assert np.allclose(x_hat, 0.0)
+
+    @pytest.mark.parametrize("bad_bits", [2, 3, 4, 8])
+    def test_rejects_non_one_num_bits(self, bad_bits):
+        """QJL is 1-bit only; higher num_bits must raise, not silently coerce."""
+        with pytest.raises(ValueError, match="1-bit-only"):
+            QJLQuantizer(d=D, num_bits=bad_bits, seed=42)

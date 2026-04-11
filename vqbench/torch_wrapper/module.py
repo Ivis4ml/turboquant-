@@ -52,6 +52,9 @@ def _get_method_class(name: str) -> type[VectorQuantizer]:
         "BlockTurboQuantMSE-B40": lambda d, num_bits, seed=42: BlockTurboQuantMSE(
             d=d, num_bits=num_bits, block_size=40, seed=seed,
         ),
+        "BlockTurboQuantMSE-B64": lambda d, num_bits, seed=42: BlockTurboQuantMSE(
+            d=d, num_bits=num_bits, block_size=64, seed=seed,
+        ),
         "RaBitQ1Bit": RaBitQ1Bit,
         "ExtRaBitQ": ExtRaBitQ,
     }
@@ -139,6 +142,12 @@ class QuantizedKVCache(nn.Module):
         device = key_states.device
         dtype = key_states.dtype
         batch_size = key_states.shape[0]
+        if batch_size != 1:
+            raise ValueError(
+                f"QuantizedKVCache.update() requires batch_size == 1, got {batch_size}. "
+                "Batched inference is not supported — each sequence would need its "
+                "own per-head compressors. Run sequences one at a time."
+            )
 
         # Step 1: read past cache state (decompressed) BEFORE adding this chunk
         past_k, past_v = self.get(
@@ -174,6 +183,12 @@ class QuantizedKVCache(nn.Module):
         Returns:
             (keys, values): shape (batch, num_kv_heads, total_seq, head_dim)
         """
+        if batch_size != 1:
+            raise ValueError(
+                f"QuantizedKVCache.get() requires batch_size == 1, got {batch_size}. "
+                "Each compressor holds a single sequence; broadcasting across a "
+                "batch axis would misrepresent per-sample state."
+            )
         all_keys = []
         all_values = []
         for h in range(self.num_kv_heads):
@@ -218,7 +233,7 @@ class QuantizedKVCache(nn.Module):
         return total_bits // 8
 
     def compression_ratio(self) -> float:
-        """Compression ratio vs fp16 storage."""
+        """Compression ratio vs fp16 KV-cache storage (matches KVCacheCompressor and VQBenchCache)."""
         total_tokens = sum(
             comp.num_tokens
             for layer_comps in self._compressors

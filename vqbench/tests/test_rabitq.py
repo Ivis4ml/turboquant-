@@ -98,6 +98,12 @@ class TestRaBitQ1Bit:
         x_hat = q.dequantize(qv)
         assert np.allclose(x_hat, 0.0, atol=1e-10)
 
+    @pytest.mark.parametrize("bad_bits", [2, 3, 4, 8])
+    def test_rejects_non_one_num_bits(self, bad_bits):
+        """RaBitQ1Bit is 1-bit only; higher num_bits must raise, not silently coerce."""
+        with pytest.raises(ValueError, match="1-bit-only"):
+            RaBitQ1Bit(d=D, num_bits=bad_bits, seed=METHOD_SEED)
+
 
 class TestExtRaBitQ:
     @pytest.fixture(autouse=True)

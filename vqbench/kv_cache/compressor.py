@@ -71,12 +71,20 @@ class KVCacheCompressor:
         return k_bits + v_bits
 
     def compression_ratio(self) -> float:
-        """Compression ratio vs fp32 storage."""
+        """
+        Compression ratio vs fp16 storage.
+
+        fp16 is the reference baseline for KV-cache reporting because that is
+        what HuggingFace transformers and llama.cpp actually store. The earlier
+        implementation reported against fp32, which double-counted the savings
+        and was inconsistent with QuantizedKVCache.compression_ratio() /
+        VQBenchCache.compression_ratio(). All three paths now agree.
+        """
         n = self.num_tokens
         if n == 0:
             return 0.0
-        fp32_bits = n * self.head_dim * 32 * 2  # keys + values
-        return fp32_bits / max(self.storage_bits(), 1)
+        fp16_bits = n * self.head_dim * 16 * 2  # keys + values
+        return fp16_bits / max(self.storage_bits(), 1)
 
     def clear(self) -> None:
         """Clear the compressed cache."""
