@@ -28,3 +28,6 @@ turboquant_plus/
 # OS
 .DS_Store
 Thumbs.db
+
+# Result
+results/

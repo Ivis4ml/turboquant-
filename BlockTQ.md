@@ -249,26 +249,22 @@ $$\underbrace{\text{outlier 隔离能力}}_{\text{B 越小越好}} \quad \text{v
 | `vqbench/tests/test_block_quant.py` | 21 个测试（含 block 严格优于 scalar 的 hypothesis test） |
 | `vqbench/torch_wrapper/module.py` | HF Cache 集成（支持 `BlockTurboQuantMSE-B16/B32`） |
 
-快速使用：
+快速使用和 KV-cache 集成都放在 [`scripts/quickstart_block_turboquant.py`](scripts/quickstart_block_turboquant.py) 里了，doc 不再内嵌代码：
 
-```python
-from vqbench.methods.turboquant.block_mse import BlockTurboQuantMSE
+```bash
+# Pure NumPy demo: BlockTQ B=16 vs scalar TQ-MSE at d=128, 4-bit
+python scripts/quickstart_block_turboquant.py
 
-q = BlockTurboQuantMSE(d=128, num_bits=4, block_size=32, seed=42)
-qv = q.quantize(x)        # x ∈ R^128
-x_hat = q.dequantize(qv)  # 重建
-print(q.storage_bits(qv))  # 576 bits (= 4.50 bits/dim)
+# 改 block size / bits / d
+python scripts/quickstart_block_turboquant.py --d 128 --block-size 32 --bits 4
+
+# 加 HF transformers Cache 集成（需要 [validation] extras）
+python scripts/quickstart_block_turboquant.py --with-hf-cache --model Qwen/Qwen2.5-1.5B
 ```
 
-KV cache 集成：
+存储对照表（REPORT §6 head_dim 128 和 256）：
 
-```python
-from vqbench.torch_wrapper.hook import make_vqbench_cache
-
-cache = make_vqbench_cache(
-    model.config,
-    method_key='BlockTurboQuantMSE-B32',    # K cache: block 4-bit
-    method_value='TurboQuantMSE',            # V cache: scalar (V compression is free)
-    num_bits_key=4, num_bits_value=4,
-)
+```bash
+python scripts/storage_accounting_table.py            # head_dim = 128
+python scripts/storage_accounting_table.py --d 256    # Qwen3.5 regime
 ```
