@@ -3,8 +3,8 @@ Long-context stress test for Qwen3.5-4B KV compression.
 
 Qwen3.5-4B 4-bit K is near-lossless on 512 tokens (REPORT.md §3), but
 KV cache compression's actual value is at long context. This script
-runs the headline configs at max_tokens ∈ {512, 1024, 2048, 4096} and
-reports the ΔPPL trend as cache boundaries accumulate.
+runs the headline configs at increasing max_tokens and reports the ΔPPL
+trend as cache boundaries accumulate.
 
 At chunk = 256, the number of cache boundaries (moments where past K/V
 is read from compressed storage rather than fp16) is max_tokens/chunk − 1:
@@ -16,14 +16,15 @@ is read from compressed storage rather than fp16) is max_tokens/chunk − 1:
 If 4-bit K compression is truly lossless, ΔPPL should stay at 0 as
 boundaries grow. If quantization error accumulates, ΔPPL will trend up.
 
-Configs tested (3 representative K-only monkey-patch runs):
+Configs tested (4 K-only monkey-patch runs, see CONFIGS list):
   - Scalar TurboQuantMSE 4-bit K (the §3 headline row)
   - Block B=64 4-bit K (Phase 9.1 block variant)
+  - ExtRaBitQ 4-bit K
   - Scalar TurboQuantMSE 3-bit K (stress test at lower bit budget)
 
 Per length × config runtime scales roughly as O(length²) because attention
 scales with past-cache length. On M5 Pro with cached weights the default
-config takes ~8 minutes for 3 lengths × 3 configs.
+config takes ~8 minutes for 3 lengths × 4 configs.
 
 Usage:
     python scripts/long_context_qwen35_4b.py
@@ -106,6 +107,7 @@ def main() -> int:
     max_len = max(args.lengths)
     enc_full = load_wikitext2_encodings(tok, max_tokens=max_len)
     print(f"  encoded {enc_full.size(1)} tokens (will truncate per-length)")
+    open(log_path, "w").close()  # truncate after model loads — no stale rows
 
     patch_v_tag = "K+V" if args.patch_v else "K-only"
     print(f"\nSweep: lengths = {args.lengths}, chunk = {args.chunk}, {patch_v_tag}")

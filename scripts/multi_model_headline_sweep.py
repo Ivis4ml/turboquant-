@@ -107,6 +107,7 @@ def main() -> int:
 
     os.makedirs(args.output_dir, exist_ok=True)
     results_path = os.path.join(args.output_dir, "sweep.jsonl")
+    open(results_path, "w").close()  # truncate before sweep — no stale rows
 
     # aggregated[(model, config_tag)] = list of ΔPPL% values, one per seed
     aggregated: dict[tuple[str, str], dict] = {}

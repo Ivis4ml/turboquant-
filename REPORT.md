@@ -30,9 +30,9 @@ Compression columns are at head_dim = 256: **K vs fp16** is the K-cache compress
 | ExtRaBitQ 3-bit K+V | 3.50 | +3.734% | 1.666% | 4.57× | 4.57× |
 | RaBitQ 1-bit K, V fp16 | 1.25 | +13.344% | 0.725% | 12.80× | 1.86× |
 
-**One-line conclusion.** Four K-only configurations are **strictly lossless** on Qwen3.5-4B across seeds (std = 0) — but they only give 1.56–1.60× total KV savings because V stays fp16. **Block B=64 at 4-bit K+V is the only configuration that is both strictly lossless AND delivers a real 3.76× total KV compression**, matching `turboquant_plus turbo4 = 4.25 bits/val` exactly. Scalar TQ-MSE K+V=4 and ExtRaBitQ K+V=4 reach the same 3.94× and 3.56× compression but with non-zero variance (+0.26% ± 0.37%). At 3-bit K+V, ExtRaBitQ (+3.73%) is noticeably worse than Block B=32 (+1.32%) and Scalar TQ-MSE (+0.52%) — RaBitQ's even integer grid loses to Lloyd-Max at tight bit budgets. RaBitQ 1-bit gives the highest nominal K compression (12.80×) but only 1.86× total KV savings and +13.3% PPL, so it's out of scope for production quality. **The clean recommendation for the 27B deployment remains Block B=64 4-bit K+V**: 3.76× total KV compression, strictly 0 ΔPPL across seeds, stable out to 8192 tokens / 31 cache boundaries (§3.4).
+**One-line conclusion.** Four K-only configurations are **lossless at measurement precision** on Qwen3.5-4B across seeds (std = 0; ΔPPL < 1 ppm, below fp32 accumulation noise — see §3.5) — but they only give 1.56–1.60× total KV savings because V stays fp16. **Block B=64 at 4-bit K+V is the only configuration that is both lossless at measurement precision AND delivers a real 3.76× total KV compression**, matching `turboquant_plus turbo4 = 4.25 bits/val` exactly. Scalar TQ-MSE K+V=4 and ExtRaBitQ K+V=4 reach the same 3.94× and 3.56× compression but with non-zero variance (+0.26% ± 0.37%). At 3-bit K+V, ExtRaBitQ (+3.73%) is noticeably worse than Block B=32 (+1.32%) and Scalar TQ-MSE (+0.52%) — RaBitQ's even integer grid loses to Lloyd-Max at tight bit budgets. RaBitQ 1-bit gives the highest nominal K compression (12.80×) but only 1.86× total KV savings and +13.3% PPL, so it's out of scope for production quality. **The clean recommendation for the 27B deployment remains Block B=64 4-bit K+V**: 3.76× total KV compression, strictly 0 ΔPPL across seeds, stable out to 8192 tokens / 31 cache boundaries (§3.4).
 
-**Projected Qwen3.5-27B memory footprint on M5 Pro 48 GB:** ~22 GB total (18 GB AWQ-int4 weights + 1.8 GB KV cache at 128K ctx + 2 GB activations) — **26 GB headroom**. See §7.
+**Projected Qwen3.5-27B memory footprint on M5 Pro 48 GB:** ~24.3 GB total (18 GB AWQ-int4 weights + 4.25 GB KV cache at 128K ctx with Block B=64 K=V=4 + 2 GB activations) — **~23.7 GB headroom**. See §7.
 
 ---
 
@@ -50,7 +50,7 @@ Compression columns are at head_dim = 256: **K vs fp16** is the K-cache compress
 - **Loss** computed as manual per-token CE with explicit boundary handling. HF's `labels=input_ids` shortcut silently drops one token at every chunk boundary via `shift_logits / shift_labels`; using it breaks chunk invariance. See `tests/test_streaming_ppl.py::test_baseline_chunk_invariance` for the regression lock.
 - **Current Qwen3.5 caveat.** `VQBenchCache` does not yet handle hybrid-attention routing, so the Qwen3.5-4B numbers below come from **monkey-patching** the 8 full-attention layers' `k_proj` / `v_proj`. Monkey-patching quantizes the current chunk too (not just past), so it **over-estimates** degradation vs the faithful semantics. ΔPPL ≈ 0 under this pessimistic mode is strong evidence, but a native hybrid cache is a Phase 9.2 item (see [`PLAN.md`](PLAN.md)).
 - **Dataset:** WikiText-2 test split, first 512 tokens (monkey-patching mode), chunk size 256.
-- **Seeds:** single-run point estimates. Variance / CI reporting is a known gap (§8).
+- **Seeds:** 3 seeds (run_seed ∈ {42, 43, 44}); see §3 for variance bars.
 
 ### 2.3 Definitions
 
@@ -70,10 +70,10 @@ fp16 baseline: **10.3866** (seed-independent, 0.9 s per run). 13 configs × 3 se
 
 | Config | mean ΔPPL | std | K vs fp16 | **Total KV** | verdict |
 |--------|----------:|----:|----------:|-------------:|---------|
-| **TQ-MSE K=4 (K-only)** | **+0.000%** | **0.000%** | 3.94× | **1.60×** | strictly lossless |
-| **Block B=64 K=4 (K-only)** | **+0.000%** | **0.000%** | 3.76× | **1.58×** | strictly lossless |
-| **ExtRaBitQ K=4 (K-only)** | **+0.000%** | **0.000%** | 3.56× | **1.56×** | strictly lossless |
-| **Block B=64 K=V=4** | **+0.000%** | **0.000%** | 3.76× | **3.76×** | strictly lossless, best deployment |
+| **TQ-MSE K=4 (K-only)** | **+0.000%** | **0.000%** | 3.94× | **1.60×** | lossless at measurement precision |
+| **Block B=64 K=4 (K-only)** | **+0.000%** | **0.000%** | 3.76× | **1.58×** | lossless at measurement precision |
+| **ExtRaBitQ K=4 (K-only)** | **+0.000%** | **0.000%** | 3.56× | **1.56×** | lossless at measurement precision |
+| **Block B=64 K=V=4** | **+0.000%** | **0.000%** | 3.76× | **3.76×** | lossless at measurement precision, best deployment |
 | TQ-MSE K=V=4 | +0.262% | 0.370% | 3.94× | 3.94× | seed-dependent |
 | ExtRaBitQ K=V=4 | +0.262% | 0.371% | 3.56× | 3.56× | seed-dependent |
 | TQ-MSE K=3 (K-only) | +0.528% | 0.980% | 5.22× | 1.68× | **std > mean** (noise) |
@@ -92,7 +92,7 @@ fp16 baseline: **10.3866** (seed-independent, 0.9 s per run). 13 configs × 3 se
 - **ExtRaBitQ K=4 (K-only)** — matches the two TurboQuant variants, std = 0
 - **Block B=64 K=V=4** ← the clean production recommendation
 
-All four always produce the exact same PPL (10.3866 to 4 decimals) regardless of rotation seed. At head_dim = 256 the choice of K-quantization method does not matter at 4-bit, as long as V is kept in fp16 OR the method is Block B=64. **"Strictly lossless" is precise at 4-decimal display resolution, but not at raw fp32 precision** — see §3.5 for the diagnostic. The K tensors ARE being perturbed (per-layer nMSE ≈ 0.0093, matching theory); the perturbation just fails to propagate into a measurable end-to-end CE change because (i) only 8/32 layers have a K cache, (ii) attention is robust to small K perturbations, and (iii) the resulting CE delta falls below the fp32 accumulation noise floor (~1e-5 in absolute PPL over 511 tokens).
+All four always produce the exact same PPL (10.3866 to 4 decimals) regardless of rotation seed. At head_dim = 256 the choice of K-quantization method does not matter at 4-bit, as long as V is kept in fp16 OR the method is Block B=64. **"Lossless at measurement precision" means: 0 ΔPPL at 4-decimal display resolution, but not at raw fp32 precision** — see §3.5 for the diagnostic. The K tensors ARE being perturbed (per-layer nMSE ≈ 0.0093, matching theory); the perturbation just fails to propagate into a measurable end-to-end CE change because (i) only 8/32 layers have a K cache, (ii) attention is robust to small K perturbations, and (iii) the resulting CE delta falls below the fp32 accumulation noise floor (~1e-5 in absolute PPL over 511 tokens).
 
 **(b) Only Block B=64 is lossless at K+V=4.** Scalar TQ-MSE K=V=4 is seed-dependent (+0.262% ± 0.370%) and ExtRaBitQ K=V=4 has exactly the same statistics (+0.262% ± 0.371%). Block B=64 K=V=4 on the same three seeds gives strictly {10.3866, 10.3866, 10.3866}. This is a **real, directional, reproducible advantage** for Block quantization at K+V=4 on Qwen3.5-4B — Block's per-block scale successfully absorbs outlier channels that Scalar's global norm and ExtRaBitQ's fixed integer grid cannot.
 
@@ -102,7 +102,7 @@ All four always produce the exact same PPL (10.3866 to 4 decimals) regardless of
 
 **(e) Every 3-bit and K+V configuration for TurboQuant is inside the noise floor.** 3-bit TQ-MSE and Block B=32 both have std ≥ mean, meaning we cannot distinguish 3-bit configurations from each other at the current resolution (512 tokens, 2 chunks). Single-seed 3-bit conclusions should be discarded — the range `{−0.78%, +2.38%}` includes cases where quantization _improves_ PPL over fp16 (noise).
 
-**(f) The production ordering at 4-bit is unambiguous.** At K+V=4, only Block B=64 is strictly lossless. At K-only=4, any of {Scalar TQ-MSE, Block B=64, ExtRaBitQ} works. Scalar TQ-MSE K=V=4 and ExtRaBitQ K=V=4 are seed-dependent — if you want guaranteed lossless behavior at 4-bit K+V, you need Block quantization. Block B=64 is also the storage match for `turboquant_plus turbo4 = 4.25 bits/val`, so it's the natural 27B production choice regardless of quality considerations.
+**(f) The production ordering at 4-bit is unambiguous.** At K+V=4, only Block B=64 is lossless at measurement precision. At K-only=4, any of {Scalar TQ-MSE, Block B=64, ExtRaBitQ} works. Scalar TQ-MSE K=V=4 and ExtRaBitQ K=V=4 are seed-dependent — if you want guaranteed lossless behavior at 4-bit K+V, you need Block quantization. Block B=64 is also the storage match for `turboquant_plus turbo4 = 4.25 bits/val`, so it's the natural 27B production choice regardless of quality considerations.
 
 ### 3.3 bits/val parity with `turboquant_plus`
 
@@ -136,13 +136,13 @@ All quant configs are K-only (V stays fp16), so "K cache vs fp16" shows K alone 
 
 **(c) 3-bit K compression is also stable.** TQ-MSE K=3 ΔPPL: 1.58% → 1.38% → 1.32% → 0.85% → 0.96% as length grows. This hovers around 1% without accumulation. The §3.1 variance sweep puts the K=3 noise floor around ±1.0–1.5%, so the length-varying numbers are all within one seed's variance of each other. The clean directional claim is **3-bit K stays at ~1% across context lengths, no explosion**.
 
-**(d) Block B=64 is the production-safe 4-bit choice.** Combined with §3.1's finding that Block B=64 is the only method strictly lossless at K+V=4, and §3.4's finding that Block B=64 is the only 4-bit method with consistently negative ΔPPL across all context lengths (−0.24% to −0.12% at 4K–8K), this is the recommended config for the 27B deployment.
+**(d) Block B=64 is the production-safe 4-bit choice.** Combined with §3.1's finding that Block B=64 is the only method lossless at measurement precision at K+V=4, and §3.4's finding that Block B=64 is the only 4-bit method with consistently negative ΔPPL across all context lengths (−0.24% to −0.12% at 4K–8K), this is the recommended config for the 27B deployment.
 
 **Implication for 27B at 128K context.** Qwen3.5-27B has the same head_dim = 256, same hybrid-attention ratio, and will be deployed at contexts up to 128K (16× the 8192-token test). The long-context sweep's flat behavior out to 31 boundaries (8K tokens) is strong evidence that 4-bit K will still hold at 128K (~512 boundaries at chunk = 256). **No upward trend is visible in any row of the table**, which is the most direct evidence one can get without actually running 128K. A 16K or 32K stress run would strengthen this further; even 32K at monkey-patch path would take ~10 minutes per config, which is tractable.
 
 ### 3.5 Diagnostic — Why 4-bit K shows 0.00% on Qwen3.5-4B
 
-The "strictly lossless" result looked too clean, so we verified it by instrumenting the monkey-patch path to record (i) hook firings per layer, (ii) per-layer K vs K̂ distance, and (iii) raw fp32 PPL difference before 4-decimal rounding. Run `scripts/diagnose_qwen35_lossless.py --method TurboQuantMSE --bits 4` to reproduce.
+The "lossless at measurement precision" result looked too clean, so we verified it by instrumenting the monkey-patch path to record (i) hook firings per layer, (ii) per-layer K vs K̂ distance, and (iii) raw fp32 PPL difference before 4-decimal rounding. Run `scripts/diagnose_qwen35_lossless.py --method TurboQuantMSE --bits 4` to reproduce.
 
 ```
 Hooks fired: 16 calls across 8 full-attention layers (layer indices [3, 7, 11, 15, 19, 23, 27, 31])
@@ -168,7 +168,7 @@ End-to-end PPL at fp32 precision:
 
 **Four findings.** (1) **Monkey-patch is firing correctly** — 8 layers × 2 chunks = 16 hook calls, exactly as expected for the 512-token / chunk-256 run. (2) **K tensors are really being perturbed** — per-layer nMSE = 0.00935, matching synthetic §5.5 (0.0093 at d=256, b=4). (3) **But the end-to-end PPL diff is ~1 ppm** (−0.0000096), below the fp32 CE accumulation noise floor (~1e-4 over 511 tokens). At 4-decimal display this rounds to 0.0000 and the sign is not even meaningful. (4) **The real K nMSE is 2.4× the theoretical Lloyd-Max bound** (0.00935 vs 4⁻⁴ = 0.0039) — Qwen3.5-4B's K distribution after Haar rotation is not perfectly Gaussian; it has mild heavy tails. This is consistent with `norm_correction=True` (which trades a little reconstruction MSE for better α-bias, §5.7) and with real activations being slightly non-isotropic.
 
-**Refined claim.** Instead of "strictly lossless," the accurate statement is: **4-bit K on Qwen3.5-4B perturbs K tensors by ~1% per vector (nMSE 0.0093), but the resulting end-to-end CE change is < 1 ppm — below both the 4-decimal PPL display precision and the fp32 accumulation noise floor.** For the 27B deployment story this is the same thing as "lossless" (you cannot distinguish them on any metric), but the underlying mechanism is "K is perturbed, but attention smears the error out across 24 linear-attention layers and 8 robust softmax operations, and the output is unchanged at measurement precision."
+**Refined claim.** To be precise about "lossless at measurement precision": **4-bit K on Qwen3.5-4B perturbs K tensors by ~1% per vector (nMSE 0.0093), but the resulting end-to-end CE change is < 1 ppm — below both the 4-decimal PPL display precision and the fp32 accumulation noise floor.** For the 27B deployment story this is the same thing as "lossless" (you cannot distinguish them on any metric), but the underlying mechanism is "K is perturbed, but attention smears the error out across 24 linear-attention layers and 8 robust softmax operations, and the output is unchanged at measurement precision."
 
 **Why this matters for Phase 10.** The "attention is robust to K perturbation at head_dim=256" finding is strong evidence for the estimator-native attention path: if 1% per-vector direct-dequant K error is invisible at the output, then a RaBitQ estimator path with even smaller IP bias should also be invisible, and the ~32-bit metadata savings (Phase 10.1) come for free. See [`PLAN.md`](PLAN.md) §5.
 
@@ -194,7 +194,7 @@ Run fresh on 2026-04-11 via `scripts/multi_model_headline_sweep.py --seeds 42 43
 
 **(d) At head_dim = 128, all four methods are ~within ±1% of fp16, but the std swamps the mean for 3-bit.** TQ-MSE K=4 mean −0.13% ± 0.17%, Block B=16 K=4 mean +0.85% ± 0.26%, ExtRaBitQ K=4 mean −1.29% ± 1.00% (the most negative, meaning it produces slightly lower PPL than fp16 baseline on average — likely single-digit-seed statistical noise). TQ-MSE K=3 has a huge std (±3.44%) — 3-bit at head_dim = 128 is inside the variance floor and no clean claim is possible. The directional claim that survives: **at head_dim = 128, all four methods at K=4 are indistinguishable from fp16 at this resolution.** The previous "Block B=16 beats Scalar" and "ExtRaBitQ beats TQ-MSE" claims at head_dim = 128 were single-seed artifacts.
 
-**(e) Qwen3.5-4B head_dim = 256 is the clean regime — now with four strictly lossless methods.** Scalar TQ-MSE K=4, Block B=64 K=4, AND ExtRaBitQ K=4 **all give exactly 10.3866 on all 3 seeds** (std = 0.000%). Only TQ-MSE K=3 has non-zero std (±0.98%), and it's inside the variance floor. This is the regime where the algorithm is mature: rotation-seed choice doesn't matter, method choice doesn't matter, and the 27B deployment should land cleanly regardless of which 4-bit K method you pick.
+**(e) Qwen3.5-4B head_dim = 256 is the clean regime — now with four methods lossless at measurement precision.** Scalar TQ-MSE K=4, Block B=64 K=4, AND ExtRaBitQ K=4 **all give exactly 10.3866 on all 3 seeds** (std = 0.000%). Only TQ-MSE K=3 has non-zero std (±0.98%), and it's inside the variance floor. This is the regime where the algorithm is mature: rotation-seed choice doesn't matter, method choice doesn't matter, and the 27B deployment should land cleanly regardless of which 4-bit K method you pick.
 
 **Implication for Qwen3.5-27B:** same head_dim = 256, same hybrid architecture ratio → same per-layer quality. Based on 3-seed measurements, **ΔPPL at 4-bit K is strictly 0** across four methods, so Scalar TQ-MSE, Block B=64, and ExtRaBitQ should all be essentially indistinguishable at 4-bit on 27B. Take the one with the best storage/metadata trade-off (Block B=64 at 4.25 bits/val, matching `turboquant_plus turbo4`).
 
@@ -206,16 +206,16 @@ Earlier drafts of this report stated "V compression at head_dim=256 costs ~0.8%"
 
 | K+V config | mean ΔPPL | std | verdict |
 |------------|----------:|----:|---------|
-| **Block B=64 4-bit K+V** | **+0.000%** | **0.000%** | **strictly lossless** — V is free |
+| **Block B=64 4-bit K+V** | **+0.000%** | **0.000%** | **lossless at measurement precision** — V is free |
 | Scalar TQ-MSE 4-bit K+V | +0.262% | 0.370% | seed-dependent (0 or +0.79%) |
 | Block B=32 3-bit K+V | +1.324% | 1.488% | inside noise floor |
 | Scalar TQ-MSE 3-bit K+V | +0.524% | 0.371% | seed-dependent |
 
-**"V is free" DOES hold at head_dim = 256 for Block quantization.** Block B=64 K+V=4 gives exactly 10.3866 on all 3 seeds — strictly lossless even when V is also quantized. Scalar TQ-MSE, by contrast, is seed-dependent at K+V=4: two seeds give 10.3866, one seed gives 10.4682. The difference is that Block's per-block scale successfully isolates the V tensor's outlier channels that Scalar's global norm cannot, and this matters just enough to catch the one-in-three seed where Scalar would have hit a bad rotation.
+**"V is free" DOES hold at head_dim = 256 for Block quantization.** Block B=64 K+V=4 gives exactly 10.3866 on all 3 seeds — lossless at measurement precision even when V is also quantized. Scalar TQ-MSE, by contrast, is seed-dependent at K+V=4: two seeds give 10.3866, one seed gives 10.4682. The difference is that Block's per-block scale successfully isolates the V tensor's outlier channels that Scalar's global norm cannot, and this matters just enough to catch the one-in-three seed where Scalar would have hit a bad rotation.
 
 **At 3-bit, V compression has a measurable cost, but inside the noise floor.** All 3-bit K+V configurations have `std ≥ mean` on 3 seeds at 512 tokens — they are within single-run variance and no clean directional conclusion is possible at this resolution. Both scalar and Block are in the same noisy bucket.
 
-**Implication for Phase 10.** The "K uses RaBitQ estimator-native path, V stays on MSE-family methods" split (see [`PLAN.md`](PLAN.md) §5) stands: at 4-bit, Block V is strictly free; at 3-bit, V contributes measurable (though noisy) error. V should use the lowest-MSE method (Block TurboQuantMSE B=64 specifically), not a method optimized for IP fidelity. And the **production recommendation changes from previous drafts**: use **Block B=64** for both K and V — it is the only 4-bit K+V configuration that is strictly lossless on Qwen3.5-4B across seeds.
+**Implication for Phase 10.** The "K uses RaBitQ estimator-native path, V stays on MSE-family methods" split (see [`PLAN.md`](PLAN.md) §5) stands: at 4-bit, Block V is strictly free; at 3-bit, V contributes measurable (though noisy) error. V should use the lowest-MSE method (Block TurboQuantMSE B=64 specifically), not a method optimized for IP fidelity. And the **production recommendation changes from previous drafts**: use **Block B=64** for both K and V — it is the only 4-bit K+V configuration that is lossless at measurement precision on Qwen3.5-4B across seeds.
 
 ---
 
@@ -526,7 +526,7 @@ Runtime ~8 minutes on M5 Pro with cached weights. Produces the full §4 table in
 python scripts/variance_qwen35_4b.py --seeds 42 43 44 --output-dir results/variance/
 ```
 
-Runtime ~5 minutes for 8 configs × 3 seeds on 512 WikiText-2 tokens. Produces the §3.1 mean ± std headline in `results/variance/variance_runs.jsonl`.
+Runtime ~15 minutes for 13 configs × 3 seeds on 512 WikiText-2 tokens. Produces the §3.1 mean ± std headline in `results/variance/variance_runs.jsonl`.
 
 ### 11.9 Long-context stability sweep (§3.4)
 
@@ -534,7 +534,7 @@ Runtime ~5 minutes for 8 configs × 3 seeds on 512 WikiText-2 tokens. Produces t
 python scripts/long_context_qwen35_4b.py --lengths 512 1024 2048 4096
 ```
 
-Runtime ~15 minutes for 4 lengths × 3 configs (fp16 + 3 quant configs). Produces the §3.4 table in `results/long_context/long_context_runs.jsonl`.
+Runtime ~15 minutes for 3 lengths × 4 configs (fp16 baseline + 4 quant configs per length). Produces the §3.4 table in `results/long_context/long_context_runs.jsonl`.
 
 ---
 

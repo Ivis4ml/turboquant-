@@ -17,7 +17,7 @@ Design notes:
     `patch_model_kv(k=factory, v=factory)`.
   * fp16 baseline is measured once (no seed dependency).
 
-Requires [validation] extras. Runtime ~8 min on M5 Pro for 7 configs × 3 seeds
+Requires [validation] extras. Runtime ~15 min on M5 Pro for 13 configs × 3 seeds
 on 512 WikiText-2 tokens.
 
 Usage:
@@ -116,6 +116,7 @@ def main() -> int:
     print(f"  loaded in {time.time() - t0:.1f} s")
 
     enc = load_wikitext2_encodings(tok, max_tokens=args.max_tokens)
+    open(log_path, "w").close()  # truncate after model loads — no stale rows
 
     # --- fp16 baseline (seed-independent) ---
     print("\nfp16 baseline ...")

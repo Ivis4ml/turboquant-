@@ -6,16 +6,16 @@ KV cache on a 48 GB M5 Pro and measure ΔPPL against the fp16 AWQ baseline.
 
 Memory budget (projected from Qwen3.5-4B scaling, see REPORT.md §7):
     Model weights (AWQ int4)   ~18 GB
-    KV cache (128K ctx, Block B=32 3-bit, 16 full-attn layers)   ~1.8 GB
+    KV cache (128K ctx, Block B=64 K=V=4, 16 full-attn layers)   ~4.25 GB
     Linear attention state     ~50 MB
     Activations + PyTorch       ~2 GB
     ----------------------------------
-    Total                      ~22 GB
-    Headroom on 48 GB M5 Pro   ~26 GB
+    Total                      ~24.3 GB
+    Headroom on 48 GB M5 Pro   ~23.7 GB
 
 Estimated wall clock per config: 30–60 min on M5 Pro MPS. A full 3-bit and
-4-bit sweep is ~4–8 hours. Results are checkpointed to --output-dir so runs
-can be resumed.
+4-bit sweep is ~4–8 hours. Results are written to --output-dir (previous
+results are overwritten on each fresh run).
 
 Requires the [validation] extras AND autoawq for the int4 weights:
     pip install -e '.[test,validation]'
@@ -30,7 +30,7 @@ See PLAN.md §4.2 task 9.2.2. Before using this script, confirm that:
   1. The AWQ int4 checkpoint for Qwen3.5-27B is available on Hugging Face
      (update --model if the canonical name differs at runtime).
   2. autoawq is installed and imports cleanly.
-  3. You have ~22 GB of free unified memory.
+  3. You have ~24 GB of free unified memory.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ def main() -> int:
     print(f"  device:     {args.device}")
     print(f"  output:     {args.output_dir}")
     for c in configs:
-        print(f"    * {c['method']} {c['bits']}-bit K, V scalar TQ-MSE 4-bit")
+        print(f"    * {c['method']} {c['bits']}-bit K+V")
 
     if args.dry_run:
         print("\n[dry-run] not loading model; exiting.")
@@ -107,6 +107,7 @@ def main() -> int:
     print(f"  loaded in {time.time() - t0:.1f} s")
 
     enc = load_wikitext2_encodings(tok, max_tokens=args.max_tokens)
+    open(results_path, "w").close()  # truncate after model loads — no stale rows
 
     # ---- baseline -----
     print("\n=== fp16 baseline ===")
@@ -129,15 +130,17 @@ def main() -> int:
 
     # ---- sweep -----
     def make_factory(method_name: str, bits: int):
-        def factory(d: int, seed: int = args.seed):
+        run_seed = args.seed
+        def factory(d: int, seed: int = 0):
+            actual_seed = run_seed * 1000 + seed
             if method_name == "TurboQuantMSE":
                 from vqbench.methods.turboquant.mse import TurboQuantMSE
-                return TurboQuantMSE(d=d, num_bits=bits, seed=seed, norm_correction=True)
+                return TurboQuantMSE(d=d, num_bits=bits, seed=actual_seed, norm_correction=True)
             if method_name.startswith("BlockTurboQuantMSE-B"):
                 from vqbench.methods.turboquant.block_mse import BlockTurboQuantMSE
                 block_size = int(method_name.split("-B")[1])
                 return BlockTurboQuantMSE(
-                    d=d, num_bits=bits, block_size=block_size, seed=seed, norm_correction=True,
+                    d=d, num_bits=bits, block_size=block_size, seed=actual_seed, norm_correction=True,
                 )
             raise ValueError(f"Unknown method: {method_name}")
         return factory
@@ -147,7 +150,7 @@ def main() -> int:
         print(f"\n=== {tag} ===")
         t0 = time.time()
         factory = make_factory(c["method"], c["bits"])
-        hooks = patch_model_kv(model, k_quantizer_factory=factory)
+        hooks = patch_model_kv(model, k_quantizer_factory=factory, v_quantizer_factory=factory)
         try:
             ppl_q, _ = evaluate_streaming_ppl(
                 model, enc, device=args.device, chunk=args.chunk, cache=None,

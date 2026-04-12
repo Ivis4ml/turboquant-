@@ -31,19 +31,20 @@ from __future__ import annotations
 import argparse
 
 
-def _make_factory(method: str, bits: int, seed: int, block_size: int):
-    def factory(d: int, seed: int = seed):  # type: ignore[assignment]
+def _make_factory(method: str, bits: int, run_seed: int, block_size: int):
+    def factory(d: int, seed: int = 0):
+        actual_seed = run_seed * 1000 + seed
         if method == "TurboQuantMSE":
             from vqbench.methods.turboquant.mse import TurboQuantMSE
-            return TurboQuantMSE(d=d, num_bits=bits, seed=seed, norm_correction=True)
+            return TurboQuantMSE(d=d, num_bits=bits, seed=actual_seed, norm_correction=True)
         if method == "BlockTurboQuantMSE":
             from vqbench.methods.turboquant.block_mse import BlockTurboQuantMSE
             return BlockTurboQuantMSE(
-                d=d, num_bits=bits, block_size=block_size, seed=seed, norm_correction=True,
+                d=d, num_bits=bits, block_size=block_size, seed=actual_seed, norm_correction=True,
             )
         if method == "ExtRaBitQ":
             from vqbench.methods.rabitq.rabitq_ext import ExtRaBitQ
-            return ExtRaBitQ(d=d, num_bits=bits, seed=seed)
+            return ExtRaBitQ(d=d, num_bits=bits, seed=actual_seed)
         raise ValueError(f"Unknown method: {method}")
     return factory
 
